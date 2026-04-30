@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>最愛のガラテア — My Beloved Galatea</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>最愛のガラテア</h1>
+    <div id="subtitle">My Beloved Galatea — 5年間の学会で、彼女を完成させよ</div>
+    <div id="status-bar" class="hidden"></div>
+  </header>
+
+  <!-- ========== SETUP SCREEN ========== -->
+  <section id="setup-screen">
+    <h2>学会開幕の準備</h2>
+    <p class="flavor">
+      19世紀末、4人の研究者が己が亡くした最愛を蘇らせるべく集った。
+      研究者を選び、5年間の学会で彼女を組み上げよ。
+    </p>
+
+    <div class="setup-block">
+      <h3>あなたの名前</h3>
+      <input type="text" id="player-name-input" value="あなた" maxlength="12">
+    </div>
+
+    <div class="setup-block">
+      <h3>研究者を選ぶ</h3>
+      <div id="character-picker"></div>
+    </div>
+
+    <div class="setup-block">
+      <h3>対戦相手</h3>
+      <p class="hint">他3名はAI研究者として参加します。難度は均一です。</p>
+    </div>
+
+    <button class="btn primary" id="start-btn">学会を開幕する</button>
+  </section>
+
+  <!-- ========== GAME SCREEN ========== -->
+  <section id="game-screen" class="hidden">
+    <div id="game-layout">
+      <div id="game-main">
+        <div id="public-area">
+          <div id="info-bar"></div>
+          <div id="goal-bar"></div>
+          <div id="action-panel"></div>
+        </div>
+        <div id="players-grid"></div>
+      </div>
+      <div id="log-panel"></div>
+    </div>
+  </section>
+
+  <!-- ========== END SCREEN ========== -->
+  <section id="end-screen" class="hidden">
+    <h2>最終学会 — 結果発表</h2>
+    <div id="final-results"></div>
+    <button class="btn primary" id="restart-btn">もう一度挑む</button>
+  </section>
+
+  <!-- ========== MODAL ========== -->
+  <div id="modal-overlay" class="hidden">
+    <div id="modal-content"></div>
+  </div>
+
+  <!-- ========== CUTIN LAYER ========== -->
+  <div id="cutin-layer"></div>
+</div>
+
+<script src="data.js"></script>
+<script src="game.js"></script>
+</body>
+</html>

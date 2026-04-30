@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Preview__preview_start",
+      "Bash(rm -f *.svg)",
+      "Read(//c/c/Users/pandorina1013/Documents/GitHub/mybelovedgalatea/**)",
+      "Bash(python _resize.py)",
+      "Bash(rm _resize.py)",
+      "Bash(rm -f assets/allele-akakuchi.jpg assets/allele-dousatsu.jpg assets/allele-hagane.jpg assets/allele-jiai.jpg assets/allele-junjou.jpg assets/allele-kansatsu.jpg assets/allele-kibin.jpg assets/allele-kuroginu.jpg assets/allele-kyoumei.jpg assets/allele-mitsunokyoku.jpg assets/allele-shinaru.jpg assets/allele-sukitooru.jpg assets/allele-sukoyaka.jpg assets/allele-takumashii.jpg assets/allele-tsuyoishin.jpg assets/allele-yutaka.jpg)",
+      "Bash(rm -f _dl_alleles.sh)",
+      "Bash(python _dl_alleles.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python _dl_images.py memory)",
+      "Bash(PYTHONIOENCODING=utf-8 python _dl_images.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python _dl_images.py research)"
+    ]
+  }
+}
