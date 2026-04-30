@@ -1077,6 +1077,38 @@ input[type="text"] {
   box-shadow: 2px 4px 7px rgba(0, 0, 0, 0.7), 0 0 10px rgba(212, 168, 81, 0.35);
 }
 
+/* ----- Face-down card backs (AI hands) ----- */
+/* Same dimensions as a face-up card. Decorative back patterned after the
+   matching deck stack so memory backs read as memories, research as research. */
+.card.card-back {
+  background: linear-gradient(135deg, #5a4630 0%, #2a1f15 100%);
+  border: 2px solid #6b5639;
+  position: relative;
+}
+.card.card-back::before {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  border: 1px dashed rgba(212, 168, 81, 0.35);
+  border-radius: 3px;
+  pointer-events: none;
+}
+.card.card-back::after {
+  content: "✧";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.6em;
+  color: rgba(212, 168, 81, 0.55);
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.6);
+}
+.card.card-back.memory   { background: linear-gradient(135deg, #4a2a3a 0%, #2a1a25 100%); border-color: #c9a959; }
+.card.card-back.memory::after { color: rgba(201, 169, 89, 0.65); }
+.card.card-back.research { background: linear-gradient(135deg, #2a3a4a 0%, #1a2030 100%); border-color: #5a8ac9; }
+.card.card-back.research::after { content: "⚗"; color: rgba(139, 174, 224, 0.7); }
+
 /* ----- Card hover preview (large floating card on hover) ----- */
 .card-preview {
   position: fixed;

@@ -474,6 +474,13 @@ function buildResearchCard(rid, opts = {}) {
   return card;
 }
 
+// Renders a face-down card back of the given kind ('memory' or 'research').
+// Matches the size of regular cards so face-down hands sit nicely alongside
+// face-up ones. The deck-stack back styles are reused for visual consistency.
+function buildCardBack(kind) {
+  return el('div', { class: 'card card-back ' + kind, title: '伏せ手札' });
+}
+
 function buildCharacterCard(charId, opts = {}) {
   const c = CHAR_BY_ID[charId];
   const cls = ['card', 'character-card'];
@@ -1520,10 +1527,18 @@ function scheduleAITurnIfNeeded() {
   // If anything cutin-related is in flight, hold off — the driver will
   // call this back once everything has drained.
   if (G.cutinOnScreen || G.cutinQueue.length > 0 || G.afterCutinHooks.length > 0) return;
+  // Idempotency guard: this function gets called both from endTurn() and from
+  // the driver loop right after. Without a flag, two setTimeouts fire 700 ms
+  // apart and aiTakeTurn runs twice for the same AI player — making the
+  // president call yearEnd twice in a row.
+  if (G.aiScheduled) return;
   const p = activePlayer();
-  if (p.isAI) {
-    setTimeout(() => aiTakeTurn(), 700);
-  }
+  if (!p.isAI) return;
+  G.aiScheduled = true;
+  setTimeout(() => {
+    G.aiScheduled = false;
+    aiTakeTurn();
+  }, 700);
 }
 
 // ===== AI logic =====
@@ -2275,7 +2290,13 @@ function renderPlayerBoard(p) {
       memSection.appendChild(row);
     }
   } else {
-    memSection.appendChild(el('div', { class: 'hint' }, '（伏せ手札 ' + unachieved.length + '枚）'));
+    if (unachieved.length === 0) {
+      memSection.appendChild(el('div', { class: 'hint' }, '（手札なし）'));
+    } else {
+      const row = el('div', { class: 'card-row' });
+      for (let i = 0; i < unachieved.length; i++) row.appendChild(buildCardBack('memory'));
+      memSection.appendChild(row);
+    }
   }
   board.appendChild(memSection);
 
@@ -2304,7 +2325,13 @@ function renderPlayerBoard(p) {
       resSection.appendChild(row);
     }
   } else {
-    resSection.appendChild(el('div', { class: 'hint' }, '（伏せ手札）'));
+    if (p.research.length === 0) {
+      resSection.appendChild(el('div', { class: 'hint' }, '（まだ無し）'));
+    } else {
+      const row = el('div', { class: 'card-row' });
+      for (let i = 0; i < p.research.length; i++) row.appendChild(buildCardBack('research'));
+      resSection.appendChild(row);
+    }
   }
   board.appendChild(resSection);
 
