@@ -8,34 +8,50 @@ const MAX_ROUNDS = 8;
 const MIN_CONF_ROUND = 4;
 
 // ===== AI personalities =====
-// Each AI opponent is assigned one of these. They differ in:
-//   - which research cards they free-use opportunistically
-//   - per-action score multipliers (priority bias)
-//   - targeting logic for nominate_other / interfere
+//
+// Each AI gets one personality. They diverge on five axes that all reflect
+// the current rule set (疾患はカード削除でしか治癒できない / 自家交配の
+// 顕性→劣勢→疾患カスケード / Stud Fee 0・1・2 VP の任意指定 / etc.):
+//
+//   1. scoreMult     — per-action priority bias used by aiTakeTurn
+//   2. freeUse(p,id) — which research cards to burn opportunistically
+//   3. pickInterfereTarget / pickCollabTarget / pickNominateTarget
+//                    — who the AI targets when it picks each action
+//   4. pickNominateOptions(p, target) — Stud Fee policy:
+//        returns { mine, myIdx?, theirs, theirIdx? } where each side is
+//        either 'random' (1d6) or 'designate' (任意指定). Cost = number of
+//        designated sides (0 / 1 / 2 VP). The helper pickBestSlot is used
+//        to pick the slot to give away (worst contribution) or grab (best).
+//   5. wantsSelfCross(p) — gate for the self-nominate action. With the new
+//        cascade rule, a roll on a recessive slot turns it into 疾患, and
+//        疾患 can only be cured by deleting the allele. So personalities
+//        that hate disease should refuse self-cross when many recessives
+//        are already on the board.
 const PERSONALITIES = {
   attacker: {
     label: '攻撃型',
     icon: '⚔',
     color: '#d46b6b',
-    flavor: '妨害と速攻。盤面をかき回し、自分が一歩リードしたら即閉幕を狙う。',
+    flavor: '妨害と速攻。盤面をかき回し、リーダーから狙ったカードを引き抜く。Stud Fee は惜しまない。',
     scoreMult: {
-      conference:     1.30,  // close it the moment I'm ahead
-      draw_memory:    1.35,  // bolder, lives by the sword
-      remove_allele:  0.70,  // less cleanup
-      self_nominate:  1.25,
-      nominate_other: 2.40,  // attack the leader
-      pass:           0.30,
+      conference:     1.40,  // close it the moment I'm ahead
+      draw_memory:    1.30,  // takes risks for high-tier rewards
+      remove_allele:  0.55,  // tolerates disease (won't waste actions cleaning)
+      self_nominate:  0.85,  // disease cascade is now too painful to chase recklessly
+      nominate_other: 2.30,  // attack the leader
+      draw_research:  1.05,
+      pass:           0.20,
     },
     freeUse(p, cardId) {
       const has = id => p.research.includes(id);
-      if (has('r_present')) return cardId === 'r_present';
-      if (has('r_paper') && G.era >= 3) return cardId === 'r_paper';
-      if (has('r_genome')) return cardId === 'r_genome';
-      // Tolerate disease longer
-      if (cardId === 'r_antidote') return has('r_antidote') && diseaseCount(p) >= 2;
-      if (cardId === 'r_dominant') return has('r_dominant') && p.slots.some(s => s && s.recessive && !s.disease);
-      if (cardId === 'r_collab')   return false;          // refuse mutual benefit
-      if (cardId === 'r_interfere') return has('r_interfere');  // always swing
+      if (cardId === 'r_present')   return has('r_present');
+      if (cardId === 'r_paper')     return has('r_paper') && G.era >= 3;
+      if (cardId === 'r_genome')    return has('r_genome');
+      // Tolerates disease longer; only purges when stacked.
+      if (cardId === 'r_antidote')  return has('r_antidote') && diseaseCount(p) >= 2;
+      if (cardId === 'r_dominant')  return has('r_dominant') && p.slots.some(s => s && s.recessive && !s.disease) && G.era >= 3;
+      if (cardId === 'r_collab')    return false;                               // refuses mutual benefit
+      if (cardId === 'r_interfere') return has('r_interfere');                  // always swings
       if (cardId === 'r_foresight') return has('r_foresight') && G.era <= 3;
       return false;
     },
@@ -43,10 +59,28 @@ const PERSONALITIES = {
       const goal = GOAL_BY_ID[G.goals[G.era - 1]];
       return [...others].sort((a, b) => goal.score(b) - goal.score(a))[0];
     },
-    pickCollabTarget(p, others) { return null; },
+    pickCollabTarget()                  { return null; },
     pickNominateTarget(p, others, goal) {
-      // Steal from current goal leader regardless of VP
-      return [...others].sort((a, b) => goal.score(b) - goal.score(a))[0];
+      return [...others].sort((a, b) => goal.score(b) - goal.score(a))[0];      // goal leader
+    },
+    pickNominateOptions(p, target) {
+      // Pay 2 to grab a key card from the leader the moment I can afford it.
+      // Pay 1 to designate target's side if 2 is unaffordable.
+      const tgtBest = pickBestSlot(target, /*worstFirst*/ false);
+      if (tgtBest == null) return { mine: 'random', theirs: 'random' };
+      if (p.vp >= 2 && G.era >= 2) {
+        const myWorst = pickBestSlot(p, /*worstFirst*/ true);
+        if (myWorst != null) {
+          return { mine: 'designate', myIdx: myWorst, theirs: 'designate', theirIdx: tgtBest };
+        }
+      }
+      if (p.vp >= 1) return { mine: 'random', theirs: 'designate', theirIdx: tgtBest };
+      return { mine: 'random', theirs: 'random' };
+    },
+    wantsSelfCross(p) {
+      // Self-cross only when a flip would clearly help and disease risk is low.
+      const recCount = recessiveCount(p);
+      return recCount <= 1 && diseaseCount(p) === 0;
     },
   },
 
@@ -54,49 +88,57 @@ const PERSONALITIES = {
     label: '守備型',
     icon: '🛡',
     color: '#7aa8e9',
-    flavor: '疾患除去と安定構築。波風を避け、最後まで盤面を綺麗に保つ。',
+    flavor: '疾患を絶対に避け、削除アクションで盤面を磨き続ける。Stud Fee は払わず、平和的に交換する。',
     scoreMult: {
-      claim:          1.10,
-      remove_allele:  1.55,  // clean obsessively
-      draw_memory:    0.50,  // avoid -VP risk
-      self_nominate:  0.35,  // recessive risk
-      nominate_other: 0.30,  // peace-loving
-      conference:     0.85,
-      draw_allele:    1.10,
-      pass:           1.40,
+      claim:          1.15,
+      remove_allele:  1.75,  // disease can only be removed via deletion
+      draw_memory:    0.55,  // -VP risk on misses
+      self_nominate:  0.20,  // self-cross risks disease cascade — almost never
+      nominate_other: 0.45,  // peace-loving, occasional only
+      conference:     0.90,
+      draw_allele:    1.15,
+      pass:           1.45,
     },
     freeUse(p, cardId) {
       const has = id => p.research.includes(id);
       if (cardId === 'r_present')   return has('r_present');
       if (cardId === 'r_paper')     return has('r_paper') && G.era >= 3;
       if (cardId === 'r_genome')    return has('r_genome');
-      if (cardId === 'r_antidote')  return has('r_antidote') && diseaseCount(p) > 0;   // ASAP
-      if (cardId === 'r_dominant')  return has('r_dominant') && p.slots.some(s => s && s.recessive && !s.disease);
-      if (cardId === 'r_collab')    return has('r_collab');     // safe mutual gain
-      if (cardId === 'r_interfere') return false;               // pacifist
+      if (cardId === 'r_antidote')  return has('r_antidote') && diseaseCount(p) > 0;        // any disease → cure ASAP
+      if (cardId === 'r_dominant')  return has('r_dominant') && p.slots.some(s => s && s.recessive && !s.disease);  // pre-empt disease
+      if (cardId === 'r_collab')    return has('r_collab');                                  // safe mutual gain
+      if (cardId === 'r_interfere') return false;                                            // pacifist
       if (cardId === 'r_foresight') return has('r_foresight') && G.era <= 3;
       return false;
     },
     pickCollabTarget(p, others) {
-      // Help anyone equally — pick lowest-VP for fairness
-      return [...others].sort((a, b) => a.vp - b.vp)[0];
+      return [...others].sort((a, b) => a.vp - b.vp)[0];                                     // help the laggard
     },
-    pickInterfereTarget() { return null; },
-    pickNominateTarget() { return null; },
+    pickInterfereTarget()  { return null; },
+    pickNominateTarget()   { return null; },
+    pickNominateOptions()  {
+      // If forced to nominate, never burn VP — random keeps the wallet safe.
+      return { mine: 'random', theirs: 'random' };
+    },
+    wantsSelfCross() {
+      // Defender never voluntarily self-crosses — it cascades to disease.
+      return false;
+    },
   },
 
   exploiter: {
     label: '搾取型',
     icon: '⚖',
     color: '#d4a851',
-    flavor: '交易と公開目標で稼ぐ。共同研究や指名交換を多用、損な戦闘は避ける。',
+    flavor: '指名交換と共同研究で稼ぐ商人。1VP で相手の最善カードだけ抜き取るのが得意。',
     scoreMult: {
-      claim:          1.05,
-      conference:     1.05,
-      draw_research:  1.30,  // hoard tools to trade
-      nominate_other: 1.80,  // exchange-heavy
-      remove_allele:  0.95,
-      self_nominate:  0.75,
+      claim:          1.10,
+      conference:     1.10,
+      draw_research:  1.30,                                                      // hoard tools to trade
+      nominate_other: 1.95,                                                      // exchange-heavy
+      remove_allele:  1.05,
+      self_nominate:  0.70,
+      draw_memory:    0.95,
       pass:           0.85,
     },
     freeUse(p, cardId) {
@@ -106,22 +148,34 @@ const PERSONALITIES = {
       if (cardId === 'r_genome')    return has('r_genome');
       if (cardId === 'r_antidote')  return has('r_antidote') && diseaseCount(p) > 0;
       if (cardId === 'r_dominant')  return has('r_dominant') && p.slots.some(s => s && s.recessive && !s.disease);
-      if (cardId === 'r_collab')    return has('r_collab');     // always trade
-      if (cardId === 'r_interfere') return has('r_interfere') && G.era >= 4;  // late-game only
+      if (cardId === 'r_collab')    return has('r_collab');                                  // always trade
+      if (cardId === 'r_interfere') return has('r_interfere') && G.era >= 4;                 // late-game only
       if (cardId === 'r_foresight') return has('r_foresight');
       return false;
     },
     pickCollabTarget(p, others) {
-      // Help the lowest-VP opponent — minimal threat boost
-      return [...others].sort((a, b) => a.vp - b.vp)[0];
+      return [...others].sort((a, b) => a.vp - b.vp)[0];                                     // minimal threat boost
     },
     pickInterfereTarget(p, others) {
       const goal = GOAL_BY_ID[G.goals[G.era - 1]];
       return [...others].sort((a, b) => goal.score(b) - goal.score(a))[0];
     },
-    pickNominateTarget(p, others, goal) {
-      // Pick the opponent whose alleles best fit my needs (highest unique alleles)
+    pickNominateTarget(p, others) {
+      // The richest source of variety — best chance of hitting a useful card.
       return [...others].sort((a, b) => uniqueAlleleCount(b) - uniqueAlleleCount(a))[0];
+    },
+    pickNominateOptions(p, target) {
+      // Efficient: pay 1 to designate target's side (cherry-pick), keep own random.
+      const tgtBest = pickBestSlot(target, /*worstFirst*/ false);
+      if (p.vp >= 1 && tgtBest != null) {
+        return { mine: 'random', theirs: 'designate', theirIdx: tgtBest };
+      }
+      // No VP for a fee — fall back to free random rather than skip the action.
+      return { mine: 'random', theirs: 'random' };
+    },
+    wantsSelfCross(p) {
+      // Only self-cross when it pays for a clear memory/goal jump and no disease tail.
+      return diseaseCount(p) === 0 && recessiveCount(p) === 0;
     },
   },
 };
@@ -864,33 +918,146 @@ function actDrawResearch() {
 }
 
 // ===== Action: Nominate (other player or self) =====
+//
+// Stud Fee structure (paid by nominator to target on exchange):
+//   0VP — both sides 1d6 random
+//   1VP — one side designated (own OR target's), the other random
+//   2VP — both sides designated
+// Designation cannot select diseased slots. Random rolls follow the
+// "shift-right past disease" rule from section 7.5a of the rule book.
 function actNominate() {
   const p = activePlayer();
   if (filledCount(p) === 0) {
     log(`${p.name}: 自分のアレルがないと指名できない。`); return endTurn();
   }
   if (p.isAI) {
-    // AI: simple — sometimes self-nominate, sometimes target weakest opponent
     const others = G.players.filter(o => o.id !== p.id && filledCount(o) > 0);
-    if (Math.random() < 0.4 && others.length > 0 && p.vp >= 1) {
+    if (Math.random() < 0.4 && others.length > 0) {
       const target = others[Math.floor(Math.random() * others.length)];
-      doNominateOther(p, target);
+      aiNominateOther(p, target);
     } else {
       doSelfNominate(p);
     }
   } else {
-    // Human: show modal to select self or other
+    // Step 1: pick the target
     const buttons = [
-      { label: '自家交配（1d6でランダム裏返し）', onclick: () => { closeModal(); doSelfNominate(p); } },
+      { label: '自家交配（自分を指名・コスト 0VP）', onclick: () => { closeModal(); doSelfNominate(p); } },
       ...G.players.filter(o => o.id !== p.id && filledCount(o) > 0).map(o => ({
-        label: `${o.name} を指名（1VP支払う）`,
-        disabled: p.vp < 1,
-        onclick: () => { closeModal(); doNominateOther(p, o); }
+        label: `${o.name} を指名…`,
+        onclick: () => { closeModal(); promptNominateOptions(p, o); }
       })),
       { label: 'キャンセル', onclick: () => { closeModal(); render(); } }
     ];
-    showActionListModal('アレル指名交換', '相手を選んでください', buttons);
+    showActionListModal('指名交換', '指名相手を選んでください', buttons);
   }
+}
+
+// Step 2 (human): pick designation option.
+function promptNominateOptions(p, target) {
+  const ownDesignable = p.slots.some(s => s && !s.disease);
+  const tgtDesignable = target.slots.some(s => s && !s.disease);
+  const buttons = [
+    {
+      label: '完全ランダム（0VP）',
+      onclick: () => { closeModal(); doNominateOther(p, target, { mine: 'random', theirs: 'random' }); }
+    },
+    {
+      label: '自分のスロット指定（1VP・Stud Fee）',
+      disabled: p.vp < 1 || !ownDesignable,
+      onclick: () => { closeModal(); promptDesignateOwn(p, target, { theirs: 'random' }); }
+    },
+    {
+      label: `${target.name} のスロット指定（1VP・Stud Fee）`,
+      disabled: p.vp < 1 || !tgtDesignable,
+      onclick: () => { closeModal(); promptDesignateTheir(p, target, { mine: 'random' }); }
+    },
+    {
+      label: '両方指定（2VP・Stud Fee）',
+      disabled: p.vp < 2 || !ownDesignable || !tgtDesignable,
+      onclick: () => { closeModal(); promptDesignateOwn(p, target, { theirs: 'designate' }); }
+    },
+    { label: 'キャンセル', onclick: () => { closeModal(); render(); } }
+  ];
+  showActionListModal(
+    `${target.name} を指名`,
+    'Stud Fee を支払うとスロットを任意指定できます。\n疾患持ちスロットは指定不可。指定しない側は1d6でランダム決定します。',
+    buttons
+  );
+}
+
+function promptDesignateOwn(p, target, opts) {
+  G.pending = {
+    type: 'select_own_slot',
+    message: `自分のスロットを選んでください（疾患持ちは選択不可）`,
+    filter: i => p.slots[i] && !p.slots[i].disease,
+    cb: idx => {
+      G.pending = null;
+      if (opts.theirs === 'designate') {
+        promptDesignateTheir(p, target, { mine: 'designate', myIdx: idx });
+      } else {
+        doNominateOther(p, target, { mine: 'designate', myIdx: idx, theirs: 'random' });
+      }
+    },
+  };
+  render();
+}
+
+function promptDesignateTheir(p, target, opts) {
+  G.pending = {
+    type: 'select_other_slot',
+    target: target.id,
+    message: `${target.name} のスロットを選んでください（疾患持ちは選択不可）`,
+    filter: i => target.slots[i] && !target.slots[i].disease,
+    cb: idx => {
+      G.pending = null;
+      doNominateOther(p, target, { ...opts, theirs: 'designate', theirIdx: idx });
+    },
+  };
+  render();
+}
+
+// AI nominator: each personality decides its own Stud Fee / designation policy.
+function aiNominateOther(p, target) {
+  const persona = PERSONALITIES[p.personality] || PERSONALITIES.exploiter;
+  let opts = persona.pickNominateOptions
+    ? persona.pickNominateOptions(p, target)
+    : { mine: 'random', theirs: 'random' };
+  // Safety: if the personality returned a designation but the index is null
+  // (e.g., target has only diseased slots), fall back to random for that side.
+  if (!opts) opts = { mine: 'random', theirs: 'random' };
+  if (opts.mine === 'designate' && (opts.myIdx == null || !p.slots[opts.myIdx] || p.slots[opts.myIdx].disease)) {
+    opts.mine = 'random'; delete opts.myIdx;
+  }
+  if (opts.theirs === 'designate' && (opts.theirIdx == null || !target.slots[opts.theirIdx] || target.slots[opts.theirIdx].disease)) {
+    opts.theirs = 'random'; delete opts.theirIdx;
+  }
+  // Cap fee against current VP — never pay more than I have.
+  let fee = (opts.mine === 'designate' ? 1 : 0) + (opts.theirs === 'designate' ? 1 : 0);
+  while (fee > p.vp) {
+    if (opts.mine === 'designate')      { opts.mine = 'random'; delete opts.myIdx; }
+    else if (opts.theirs === 'designate') { opts.theirs = 'random'; delete opts.theirIdx; }
+    fee = (opts.mine === 'designate' ? 1 : 0) + (opts.theirs === 'designate' ? 1 : 0);
+  }
+  doNominateOther(p, target, opts);
+}
+
+// Returns the slot index whose contribution to the current goal is
+// maximal (worstFirst=false) or minimal (worstFirst=true), among non-disease
+// non-empty slots. Returns null if no eligible slot.
+function pickBestSlot(player, worstFirst) {
+  const goal = GOAL_BY_ID[G.goals[G.era - 1]];
+  let best = null, bestScore = worstFirst ? Infinity : -Infinity;
+  for (let i = 0; i < player.slots.length; i++) {
+    const s = player.slots[i];
+    if (!s || s.disease) continue;
+    const sim = clonePlayer(player);
+    sim.slots[i] = null;
+    const score = goal.score(player) - goal.score(sim);  // marginal contribution
+    if (worstFirst ? score < bestScore : score > bestScore) {
+      bestScore = score; best = i;
+    }
+  }
+  return best;
 }
 
 // Find the next non-empty, non-diseased slot to the right of `from` (mod 6).
@@ -971,63 +1138,98 @@ function doSelfNominate(p) {
   runAfterCutins(() => endTurn());
 }
 
+// Resolve a random swap slot for `who`: roll d6; if empty re-roll; if the
+// rolled slot has a disease token, shift right to the nearest non-disease
+// non-empty slot. Returns { ok, roll, idx, shiftedFrom?, reason? }.
+function resolveRandomSwapSlot(who, label) {
+  let roll, idx, attempts = 0;
+  do {
+    roll = rollD6(label || '');
+    idx = roll - 1;
+    attempts++;
+  } while (!who.slots[idx] && attempts < 12);
+  if (!who.slots[idx]) return { ok: false, roll, idx, reason: 'empty' };
+  let shiftedFrom = null;
+  if (who.slots[idx].disease) {
+    const j = shiftRightToSwappable(who.slots, idx);
+    if (j === -1) return { ok: false, roll, idx, reason: 'all-disease' };
+    shiftedFrom = idx;
+    idx = j;
+  }
+  return { ok: true, roll, idx, shiftedFrom };
+}
+
 // ----- Rule (nominate other): exchange two alleles between players.
-// Diseased slots are NOT eligible. If the rolled slot has disease, the rule
-// resolves the swap to its right neighbor (next non-disease, non-empty slot).
-function doNominateOther(p, target) {
-  // Stud Fee
-  p.vp -= 1;
-  const fee = (target.characterId === 'wife') ? 2 : 1;
-  target.vp += fee;
-  target.studFees += fee;
-  log(`${p.name}: ${target.name} に Stud Fee ${fee}VP 支払い。`, 'event');
+// `options` shape:
+//   { mine: 'random'|'designate', myIdx?, theirs: 'random'|'designate', theirIdx? }
+// Stud Fee = number of designated sides (0–2). Designation cannot pick
+// diseased slots; random rolls shift right past disease per the rule book.
+function doNominateOther(p, target, options) {
+  options = options || { mine: 'random', theirs: 'random' };
+  const designatedCount = (options.mine === 'designate' ? 1 : 0)
+                       + (options.theirs === 'designate' ? 1 : 0);
+  const fee = designatedCount;  // 0 / 1 / 2
+  if (fee > 0) {
+    p.vp -= fee;
+    const received = fee + (target.characterId === 'wife' ? 1 : 0);
+    target.vp += received;
+    target.studFees += received;
+    log(`${p.name}: ${target.name} に Stud Fee ${received}VP 支払い (指定 ${fee}枚)。`, 'event');
+  } else {
+    log(`${p.name}: ${target.name} を完全ランダム指名 (Stud Fee なし)。`, 'event');
+  }
 
-  // Resolve a slot for player `who`: roll d6; if empty re-roll; if disease, shift right.
-  const resolveSlot = (who, label) => {
-    let roll, idx, attempts = 0;
-    do {
-      roll = rollD6(label);
-      idx = roll - 1;
-      attempts++;
-    } while (!who.slots[idx] && attempts < 12);
-    if (!who.slots[idx]) return { ok: false, roll, idx, reason: 'empty' };
-    let shiftedFrom = null;
-    if (who.slots[idx].disease) {
-      const j = shiftRightToSwappable(who.slots, idx);
-      if (j === -1) return { ok: false, roll, idx, reason: 'all-disease' };
-      shiftedFrom = idx;
-      idx = j;
-    }
-    return { ok: true, roll, idx, shiftedFrom };
-  };
-
-  const me = resolveSlot(p, `${p.name}: 自分のスロット`);
+  // Resolve each side: designated → use chosen idx; random → roll d6 with disease shift.
+  const me = options.mine === 'designate'
+    ? { ok: true, designated: true, idx: options.myIdx }
+    : resolveRandomSwapSlot(p, `${p.name}: 自分のスロット`);
   if (!me.ok) {
-    log(`${p.name}: ${me.reason === 'empty' ? '自身のスロットが空白続き' : '自身のアレルが全て疾患'}で交換失敗。`, 'loss');
+    log(`${p.name}: 自身のスロット解決失敗 (${me.reason})。`, 'loss');
     return endTurn();
   }
-  const tg = resolveSlot(target, `${target.name}: 相手のスロット`);
+  const tg = options.theirs === 'designate'
+    ? { ok: true, designated: true, idx: options.theirIdx }
+    : resolveRandomSwapSlot(target, `${target.name}: 相手のスロット`);
   if (!tg.ok) {
-    log(`${target.name}: ${tg.reason === 'empty' ? 'スロット空白続き' : '相手のアレルが全て疾患'}で交換失敗。`, 'loss');
+    log(`${target.name}: スロット解決失敗 (${tg.reason})。`, 'loss');
     return endTurn();
   }
 
   const a = p.slots[me.idx], b = target.slots[tg.idx];
-  const outcomeMe = (me.shiftedFrom != null
-    ? `Slot${me.shiftedFrom + 1}は疾患 → 右へずれ Slot${me.idx + 1}「${ALLELE_BY_ID[a.type].name}」`
-    : `Slot${me.idx + 1}「${ALLELE_BY_ID[a.type].name}」`);
-  const outcomeTg = (tg.shiftedFrom != null
-    ? `Slot${tg.shiftedFrom + 1}は疾患 → 右へずれ Slot${tg.idx + 1}「${ALLELE_BY_ID[b.type].name}」`
-    : `Slot${tg.idx + 1}「${ALLELE_BY_ID[b.type].name}」`);
+
+  const fmtOutcome = (side, alleleName) => {
+    if (side.designated) return `Slot${side.idx + 1}「${alleleName}」 (任意指定)`;
+    if (side.shiftedFrom != null) {
+      return `Slot${side.shiftedFrom + 1}は疾患 → 右へずれ Slot${side.idx + 1}「${alleleName}」`;
+    }
+    return `Slot${side.idx + 1}「${alleleName}」`;
+  };
+  // Cutin: lines for designated sides, dice rolls for random sides.
+  const lines = [];
+  const diceRolls = [];
+  if (me.designated) {
+    lines.push(`${p.name}: ${fmtOutcome(me, ALLELE_BY_ID[a.type].name)}`);
+  } else {
+    diceRolls.push({ label: p.name, value: me.roll, outcome: fmtOutcome(me, ALLELE_BY_ID[a.type].name), triggered: true });
+  }
+  if (tg.designated) {
+    lines.push(`${target.name}: ${fmtOutcome(tg, ALLELE_BY_ID[b.type].name)}`);
+  } else {
+    diceRolls.push({ label: target.name, value: tg.roll, outcome: fmtOutcome(tg, ALLELE_BY_ID[b.type].name), triggered: true });
+  }
+
+  const subtitle = fee === 0
+    ? '完全ランダム ─ 双方 1d6 で決定（疾患スロットは右へずれる）'
+    : fee === 1
+      ? `Stud Fee 1VP ─ 一方を任意指定、他方を 1d6 で決定`
+      : `Stud Fee 2VP ─ 双方を任意指定`;
 
   showCutin({
     kind: 'dice-exchange',
     title: `指名交換: ${p.name} ⇄ ${target.name}`,
-    subtitle: `双方が1d6で対象スロットを決定（疾患スロットは右へずれる）`,
-    diceRolls: [
-      { label: p.name,      value: me.roll, outcome: outcomeMe, triggered: true },
-      { label: target.name, value: tg.roll, outcome: outcomeTg, triggered: true },
-    ],
+    subtitle,
+    lines: lines.length > 0 ? lines : undefined,
+    diceRolls: diceRolls.length > 0 ? diceRolls : undefined,
     onDismiss: () => {
       p.slots[me.idx] = null;
       target.slots[tg.idx] = null;
@@ -1464,15 +1666,23 @@ function aiTakeTurn() {
   else if (p.research.length < 2) candidates.push({ kind: 'draw_research', score: 14 });
   else if (p.research.length < 4 && G.era <= 3) candidates.push({ kind: 'draw_research', score: 6 });
 
-  // Self-cross — only if expected benefit > expected disease risk
+  // Self-cross — only if benefit clears the disease-cascade risk and the
+  // personality is willing to flip its own cards. With the new rule, a roll
+  // landing on an already-recessive slot turns it into 疾患.
   const sb = aiBestSelfFlipBenefit(p);
-  if (sb > 1.5 && filledCount(p) >= 2) {
-    const expectedRisk = G.era * 0.5;
+  const willingToCross = persona.wantsSelfCross ? persona.wantsSelfCross(p) : (recessiveCount(p) <= 1);
+  if (willingToCross && sb > 1.5 && filledCount(p) >= 2) {
+    // Roll-onto-recessive probability scales with #recessive / #filled
+    const rec = recessiveCount(p);
+    const filled = filledCount(p);
+    const cascadeRisk = (rec / Math.max(1, filled)) * 6;  // each disease costs ~remaining-eras VP
+    const expectedRisk = G.era * 0.5 + cascadeRisk;
     candidates.push({ kind: 'self_nominate', score: 18 + sb - expectedRisk });
   }
 
-  // Nominate another — personality picks the target
-  if (p.vp >= 1 && filledCount(p) > 0) {
+  // Nominate another — personality picks the target. Free (0VP) random is
+  // always available; designation costs are decided in aiNominateOther.
+  if (filledCount(p) > 0) {
     const others = G.players.filter(o => o.id !== p.id && filledCount(o) > 0);
     if (others.length > 0 && persona.pickNominateTarget) {
       const target = persona.pickNominateTarget(p, others, goal);
@@ -1482,7 +1692,10 @@ function aiTakeTurn() {
         // Attacker tolerates equal-goal targets; others demand a clear behind state
         const minBehind = (p.personality === 'attacker') ? -2 : 1;
         if (tG > myG + minBehind && G.era >= 2) {
-          candidates.push({ kind: 'nominate_other', target, score: 5 + Math.min(tG - myG, 5) });
+          // Bonus when AI can afford a designation that grabs target's best card.
+          const canDesignateTarget = p.vp >= 1 && pickBestSlot(target, false) != null;
+          const designBonus = canDesignateTarget ? 3 : 0;
+          candidates.push({ kind: 'nominate_other', target, score: 5 + Math.min(tG - myG, 5) + designBonus });
         }
       }
     }
@@ -1508,7 +1721,7 @@ function aiTakeTurn() {
     case 'draw_memory':     return actDrawMemory();
     case 'draw_research':   return actDrawResearch();
     case 'self_nominate':   return doSelfNominate(p);
-    case 'nominate_other':  return doNominateOther(p, choice.target);
+    case 'nominate_other':  return aiNominateOther(p, choice.target);  // persona picks Stud Fee policy
     case 'pass':            return actPass();
   }
 }
