@@ -9,8 +9,8 @@
 <body>
 <div id="app">
   <header>
-    <h1>最愛のガラテア</h1>
-    <div id="subtitle">My Beloved Galatea — 5年間の学会で、彼女を完成させよ</div>
+    <div id="banner-slot"></div>
+    <button id="rules-btn" class="btn small">📖 ルール</button>
     <div id="status-bar" class="hidden"></div>
   </header>
 
@@ -45,9 +45,12 @@
     <div id="game-layout">
       <div id="game-main">
         <div id="public-area">
-          <div id="info-bar"></div>
-          <div id="goal-bar"></div>
-          <div id="action-panel"></div>
+          <div id="public-area-main">
+            <div id="info-bar"></div>
+            <div id="trait-tracks"></div>
+            <div id="action-panel"></div>
+          </div>
+          <div id="goal-display"></div>
         </div>
         <div id="players-grid"></div>
       </div>

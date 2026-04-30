@@ -33,7 +33,7 @@ const PERSONALITIES = {
       if (has('r_genome')) return cardId === 'r_genome';
       // Tolerate disease longer
       if (cardId === 'r_antidote') return has('r_antidote') && diseaseCount(p) >= 2;
-      if (cardId === 'r_dominant') return has('r_dominant') && diseaseCount(p) >= 2;
+      if (cardId === 'r_dominant') return has('r_dominant') && p.slots.some(s => s && s.recessive && !s.disease);
       if (cardId === 'r_collab')   return false;          // refuse mutual benefit
       if (cardId === 'r_interfere') return has('r_interfere');  // always swing
       if (cardId === 'r_foresight') return has('r_foresight') && G.era <= 3;
@@ -71,7 +71,7 @@ const PERSONALITIES = {
       if (cardId === 'r_paper')     return has('r_paper') && G.era >= 3;
       if (cardId === 'r_genome')    return has('r_genome');
       if (cardId === 'r_antidote')  return has('r_antidote') && diseaseCount(p) > 0;   // ASAP
-      if (cardId === 'r_dominant')  return has('r_dominant') && p.slots.some(s => s && s.disease);
+      if (cardId === 'r_dominant')  return has('r_dominant') && p.slots.some(s => s && s.recessive && !s.disease);
       if (cardId === 'r_collab')    return has('r_collab');     // safe mutual gain
       if (cardId === 'r_interfere') return false;               // pacifist
       if (cardId === 'r_foresight') return has('r_foresight') && G.era <= 3;
@@ -105,7 +105,7 @@ const PERSONALITIES = {
       if (cardId === 'r_paper')     return has('r_paper') && G.era >= 3;
       if (cardId === 'r_genome')    return has('r_genome');
       if (cardId === 'r_antidote')  return has('r_antidote') && diseaseCount(p) > 0;
-      if (cardId === 'r_dominant')  return has('r_dominant') && p.slots.some(s => s && s.disease);
+      if (cardId === 'r_dominant')  return has('r_dominant') && p.slots.some(s => s && s.recessive && !s.disease);
       if (cardId === 'r_collab')    return has('r_collab');     // always trade
       if (cardId === 'r_interfere') return has('r_interfere') && G.era >= 4;  // late-game only
       if (cardId === 'r_foresight') return has('r_foresight');
@@ -201,62 +201,93 @@ function animateDieIn(slot, finalValue) {
   }, 90);
 }
 
-function animateDie(finalValue) {
-  const dieSlot = $('die-slot');
-  if (!dieSlot) return;
-  // Tumble through random faces, then settle
-  const frames = [];
-  for (let i = 0; i < 6; i++) frames.push(Math.floor(Math.random() * 6) + 1);
-  frames.push(finalValue);
-  let i = 0;
-  dieSlot.innerHTML = '';
-  const die = buildDie(frames[0]);
-  die.classList.add('rolling');
-  dieSlot.appendChild(die);
-  const tick = setInterval(() => {
-    i++;
-    if (i >= frames.length) {
-      clearInterval(tick);
-      dieSlot.innerHTML = '';
-      dieSlot.appendChild(buildDie(finalValue));
-      return;
-    }
-    dieSlot.innerHTML = '';
-    const d = buildDie(frames[i]);
-    d.classList.add('rolling');
-    dieSlot.appendChild(d);
-  }, 90);
-}
 function rollD6(reason = '') {
   const v = Math.floor(Math.random() * 6) + 1;
   G.lastDieRoll = { value: v, reason };
-  animateDie(v);
-  const r = $('die-reason');
-  if (r) r.textContent = reason || '';
   return v;
 }
 
 // ===== Cut-in system =====
-G.cutinQueue = G.cutinQueue || [];
-G.cutinPlaying = false;
+//
+// Strict invariants:
+//   1. At most ONE cutin is in the DOM at a time. Never overlap.
+//   2. The queue is FIFO. New cutins always go to the end.
+//   3. After-cutin hooks run sequentially, ONE per drain cycle. A hook may
+//      queue zero or more new cutins; if it queues any, those play before
+//      the next hook fires.
+//   4. Cutins NEVER auto-advance. Only the user's ▶ 次へ click progresses.
+//
+// State:
+//   G.cutinQueue       — pending cutin opts (FIFO)
+//   G.afterCutinHooks  — pending post-drain callbacks (FIFO)
+//   G.cutinOnScreen    — true while a cutin is visible (display → dismiss)
+//   G.cutinDriving     — re-entrancy guard for runDriver()
+G.cutinQueue       = G.cutinQueue       || [];
+G.afterCutinHooks  = G.afterCutinHooks  || [];
+G.cutinOnScreen    = false;
+G.cutinDriving     = false;
 
 function showCutin(opts) {
   G.cutinQueue.push(opts);
-  if (!G.cutinPlaying) playNextCutin();
+  runDriver();
 }
 
-function playNextCutin() {
-  const layer = $('cutin-layer');
-  if (!layer || G.cutinQueue.length === 0) {
-    G.cutinPlaying = false;
-    if (layer) layer.classList.remove('active');
-    // Resume AI loop if pending
-    scheduleAITurnIfNeeded();
-    return;
+// Runs `fn` once all currently queued/displayed cutins have been dismissed
+// AND any cutins those dismisses queue have also drained. If nothing is in
+// flight, runs synchronously.
+function runAfterCutins(fn) {
+  if (G.cutinQueue.length === 0 && !G.cutinOnScreen && !G.cutinDriving) {
+    return fn();
   }
-  G.cutinPlaying = true;
+  G.afterCutinHooks.push(fn);
+}
+
+// The driver loop. Idempotent and re-entrancy-safe: nested calls return
+// immediately. The outer call drives until either a cutin is on screen
+// (waiting for the user) or there is nothing left to do.
+function runDriver() {
+  if (G.cutinDriving) return;
+  G.cutinDriving = true;
+  const layer = $('cutin-layer');
+  try {
+    while (true) {
+      // Cutin already visible → wait for its dismiss to wake us up.
+      if (G.cutinOnScreen) return;
+
+      // Pending cutin → display next.
+      if (G.cutinQueue.length > 0) {
+        const opts = G.cutinQueue.shift();
+        displayCutin(opts, layer);
+        return;  // cutinOnScreen is now true
+      }
+
+      // No cutins queued. Drain one hook. If it queues cutins, the loop
+      // displays them on the next iteration. If it queues nothing, the
+      // loop drains the next hook.
+      if (G.afterCutinHooks.length > 0) {
+        const h = G.afterCutinHooks.shift();
+        try { h(); } catch (e) { console.error(e); }
+        continue;
+      }
+
+      // Nothing to do.
+      if (layer) layer.classList.remove('active');
+      scheduleAITurnIfNeeded();
+      return;
+    }
+  } finally {
+    G.cutinDriving = false;
+  }
+}
+
+// Back-compat shim — older code paths still call playNextCutin.
+function playNextCutin() { runDriver(); }
+
+// Builds DOM for one cutin, attaches it to the layer, and wires up dismiss.
+function displayCutin(opts, layer) {
+  if (!layer) return;
+  G.cutinOnScreen = true;
   layer.classList.add('active');
-  const opts = G.cutinQueue.shift();
 
   const cutin = el('div', { class: 'cutin ' + (opts.kind || '') });
   const row = el('div', { class: 'cutin-row' });
@@ -273,40 +304,44 @@ function playNextCutin() {
     });
     inner.appendChild(list);
   }
-  // Dice rolls
   if (opts.diceRolls && opts.diceRolls.length > 0) {
     const wrap = el('div', { class: 'cutin-dice-wrap' });
     opts.diceRolls.forEach((r, idx) => {
       const item = el('div', { class: 'cutin-dice-item' + (r.triggered ? ' triggered' : '') });
       item.appendChild(el('div', { class: 'cutin-dice-label' }, r.label || ''));
       const dieSlot = el('div', { class: 'cutin-dice-die' });
-      // Show empty die placeholder; animation fills it
       dieSlot.appendChild(buildDie(null));
       item.appendChild(dieSlot);
       item.appendChild(el('div', { class: 'cutin-dice-outcome' }, r.outcome || ''));
       wrap.appendChild(item);
-      // Animate the die after a small staggered delay
       setTimeout(() => animateDieIn(dieSlot, r.value), 350 + idx * 250);
     });
     inner.appendChild(wrap);
   }
-  // Next button
+
+  let dismissed = false;
   const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
     cutin.classList.add('leaving');
     setTimeout(() => {
       layer.innerHTML = '';
-      setTimeout(() => playNextCutin(), 60);
+      G.cutinOnScreen = false;
+      if (typeof opts.onDismiss === 'function') {
+        try { opts.onDismiss(); } catch (e) { console.error(e); }
+      }
+      render();
+      // Wake the driver to display the next cutin or drain the next hook.
+      setTimeout(() => runDriver(), 60);
     }, 480);
   };
-  inner.appendChild(el('button', { class: 'cutin-next', onclick: dismiss }, '▶ 次へ'));
+  const nextBtn = el('button', { class: 'cutin-next', onclick: dismiss }, '▶ 次へ');
+  inner.appendChild(nextBtn);
   row.appendChild(inner);
   cutin.appendChild(row);
   layer.appendChild(cutin);
-
-  // Failsafe: auto-dismiss after 12s
-  setTimeout(() => {
-    if (cutin.parentNode) dismiss();
-  }, opts.maxWait || 12000);
+  // Auto-focus so Enter/Space on keyboard advances the queue.
+  setTimeout(() => { try { nextBtn.focus(); } catch (e) {} }, 50);
 }
 
 // ===== Card render helpers (Yu-Gi-Oh-style) =====
@@ -340,6 +375,7 @@ function buildAlleleCard(slot, slotIdx, opts = {}) {
     ),
     slot.disease ? el('div', { class: 'disease-token', title: '疾患マーカー: ' + a.dis }) : null
   );
+  bindPreview(card, slot.recessive ? 'allele-recessive' : 'allele-dominant', { allele: a, slot });
   return card;
 }
 
@@ -351,7 +387,7 @@ function buildMemoryCard(memId, p, opts = {}) {
   if (opts.clickable) cls.push('clickable');
   const reward = MEMORY_REWARD[m.tier];
   const stars = m.tier === 'easy' ? '★' : m.tier === 'medium' ? '★★' : '★★★';
-  return el('div', { class: cls.join(' '), title: m.desc, ...(opts.onclick ? { onclick: opts.onclick } : {}) },
+  const card = el('div', { class: cls.join(' '), ...(opts.onclick ? { onclick: opts.onclick } : {}) },
     el('div', { class: 'card-img', style: `background-image:url(assets/memory-${memId}.jpg)` },
       el('span', { class: 'card-type' }, '記憶'),
       el('span', { class: 'card-sys' }, stars)
@@ -362,13 +398,15 @@ function buildMemoryCard(memId, p, opts = {}) {
       el('div', { class: 'card-tag' }, '+' + reward + ' / -' + reward)
     )
   );
+  bindPreview(card, 'memory-' + m.tier, m);
+  return card;
 }
 
 function buildResearchCard(rid, opts = {}) {
   const r = RESEARCH_BY_ID[rid];
   const cls = ['card', 'research-card'];
   if (opts.clickable) cls.push('clickable');
-  return el('div', { class: cls.join(' '), title: r.desc, ...(opts.onclick ? { onclick: opts.onclick } : {}) },
+  const card = el('div', { class: cls.join(' '), ...(opts.onclick ? { onclick: opts.onclick } : {}) },
     el('div', { class: 'card-img', style: `background-image:url(assets/research-${rid}.jpg)` },
       el('span', { class: 'card-type' }, '研究'),
       el('span', { class: 'card-sys' }, '⚗')
@@ -378,6 +416,8 @@ function buildResearchCard(rid, opts = {}) {
       el('div', { class: 'card-effect' }, r.desc)
     )
   );
+  bindPreview(card, 'research', r);
+  return card;
 }
 
 function buildCharacterCard(charId, opts = {}) {
@@ -385,7 +425,7 @@ function buildCharacterCard(charId, opts = {}) {
   const cls = ['card', 'character-card'];
   if (opts.selected) cls.push('selected');
   if (opts.clickable || opts.onclick) cls.push('clickable');
-  return el('div', { class: cls.join(' '), ...(opts.onclick ? { onclick: opts.onclick } : {}) },
+  const card = el('div', { class: cls.join(' '), ...(opts.onclick ? { onclick: opts.onclick } : {}) },
     el('div', { class: 'card-img', style: `background-image:url(assets/char-${charId}.jpg)` },
       el('span', { class: 'card-type' }, c.title),
       el('span', { class: 'card-sys' }, '♛')
@@ -395,6 +435,8 @@ function buildCharacterCard(charId, opts = {}) {
       el('div', { class: 'card-effect' }, c.effect)
     )
   );
+  bindPreview(card, 'character', c);
+  return card;
 }
 function $(id) { return document.getElementById(id); }
 function el(tag, attrs = {}, ...children) {
@@ -654,7 +696,7 @@ function actDrawAllele() {
         render();
       }
     } else {
-      // Slot full: roll d6
+      // Slot full: roll d6 — apply overwrite on cutin dismiss so the player sees the result step-by-step.
       const roll = rollD6(`${p.name}: 上書き先`);
       const slotIdx = roll - 1;
       const old = p.slots[slotIdx];
@@ -671,14 +713,13 @@ function actDrawAllele() {
           outcome: `「${oldName}」 → 「${newName}」`,
           triggered: true,
         }],
+        onDismiss: () => {
+          if (old) G.alleleDiscard.push(old.type);
+          p.slots[slotIdx] = null;
+          placeAlleleInSlot(p, chosenId, slotIdx);
+        },
       });
-      if (old) {
-        G.alleleDiscard.push(old.type);
-      }
-      p.slots[slotIdx] = null;
-      placeAlleleInSlot(p, chosenId, slotIdx);
-      render();
-      endTurn();
+      runAfterCutins(() => endTurn());
     }
   };
 
@@ -772,6 +813,34 @@ function actDrawResearch() {
   }
   if (drawn.length === 0) { log('研究デッキが尽きた…'); return endTurn(); }
 
+  // メイド: 引いたカードを山札底に戻して引き直せる(ゲーム中2回まで)
+  if (drawN === 1 && p.characterId === 'maid' && p.maidUses < 2 && !p.isAI) {
+    return showActionListModal('研究ドロー — メイド効果',
+      `「${RESEARCH_BY_ID[drawn[0]].name}」: ${RESEARCH_BY_ID[drawn[0]].desc}`,
+      [
+        { label: `採用 — ${RESEARCH_BY_ID[drawn[0]].name}`, onclick: () => {
+          closeModal();
+          p.research.push(drawn[0]);
+          log(`${p.name}: 研究「${RESEARCH_BY_ID[drawn[0]].name}」を獲得。`);
+          endTurn();
+        }},
+        { label: `メイド効果で底へ戻して引き直す（残り${2 - p.maidUses}回）`, onclick: () => {
+          closeModal();
+          G.researchDeck.unshift(drawn[0]);
+          p.maidUses++;
+          const nu = drawCard(G.researchDeck, G.researchDiscard);
+          if (nu) {
+            p.research.push(nu);
+            log(`${p.name}: メイド効果で「${RESEARCH_BY_ID[drawn[0]].name}」を底へ → 「${RESEARCH_BY_ID[nu].name}」獲得。`, 'event');
+          } else {
+            log(`${p.name}: メイド効果で底へ戻したが再ドロー失敗。`);
+          }
+          endTurn();
+        }},
+      ]
+    );
+  }
+
   if (drawN === 1) {
     p.research.push(drawn[0]);
     log(`${p.name}: 研究「${RESEARCH_BY_ID[drawn[0]].name}」を獲得。`);
@@ -824,92 +893,150 @@ function actNominate() {
   }
 }
 
+// Find the next non-empty, non-diseased slot to the right of `from` (mod 6).
+// Returns -1 if no such slot exists.
+function shiftRightToSwappable(slots, from) {
+  for (let step = 1; step <= slots.length; step++) {
+    const j = (from + step) % slots.length;
+    if (slots[j] && !slots[j].disease) return j;
+  }
+  return -1;
+}
+
+// ----- Rule (self-nominate): roll a slot. Empty → wasted. Dominant → flip recessive
+// (= homozygous expression). Already recessive → disease. Already diseased → wasted.
 function doSelfNominate(p) {
   const isFiancee = p.characterId === 'fiancee';
-  let attempts = 0;
-  let roll, slot;
-  while (attempts < 6) {
+  // Roll until we land on a non-empty slot, or give up.
+  let attempts = 0, roll, slot;
+  while (attempts < 12) {
     roll = rollD6(`${p.name}: 自家交配`);
     slot = p.slots[roll - 1];
     if (slot) break;
     attempts++;
   }
-  log(`${p.name}: 自家交配 1d6=${roll}。`);
   if (!slot) {
     showCutin({
       kind: 'dice-cross',
       title: `${p.name}: 自家交配`,
       subtitle: '1d6 で対象スロット決定',
-      diceRolls: [{ label: `Slot${roll}`, value: roll, outcome: 'スロット空白 ─ アクション無駄', triggered: false }],
+      diceRolls: [{ label: `Slot${roll}`, value: roll, outcome: 'スロット空白続き ─ アクション無駄', triggered: false }],
     });
-    log(`${p.name}: 該当スロットが空白続きでアクション無駄に。`, 'loss');
+    log(`${p.name}: 自家交配の対象なし、アクション無駄。`, 'loss');
     return endTurn();
   }
-  // Allow re-roll once for fiancee if recessive
+  // Fiancée may re-roll once if she dislikes the result (only if non-empty result lands on disease/recessive)
   let rerollVal = null;
-  if (isFiancee && slot.recessive) {
+  if (isFiancee && (slot.recessive || slot.disease)) {
     rerollVal = rollD6(`${p.name}: 婚約者振り直し`);
-    log(`${p.name}: 婚約者効果で振り直し → 1d6=${rerollVal}。`);
     if (p.slots[rerollVal - 1]) { roll = rerollVal; slot = p.slots[rerollVal - 1]; }
   }
-  let outcome, triggered = false;
-  if (slot.recessive) {
-    outcome = `Slot${roll}「${ALLELE_BY_ID[slot.type].name}」既に劣勢発現中`;
-    log(`${p.name}: 既に劣勢発現中、アクション無駄。`, 'loss');
-  } else {
-    slot.recessive = true;
-    outcome = `Slot${roll}「${ALLELE_BY_ID[slot.type].name}」を劣勢発現!`;
+  const a = ALLELE_BY_ID[slot.type];
+  const idx = roll - 1;
+  let outcome, triggered = false, kind = 'dice-cross', mutate = () => {};
+
+  if (slot.disease) {
+    outcome = `Slot${roll}「${a.name}」は疾患持ち ─ 操作不可。アクション無駄。`;
+    log(`${p.name}: 自家交配 → 既に疾患マーカー、アクション無駄。`, 'loss');
+  } else if (slot.recessive) {
+    // Already homozygous-expressing → induce disease
+    outcome = `Slot${roll}「${a.name}」は既にホモ接合 ─ 疾患「${a.dis}」発症!`;
     triggered = true;
-    log(`${p.name}: Slot${roll}「${ALLELE_BY_ID[slot.type].name}」を劣勢発現。`, 'event');
+    kind = 'dice-disease';
+    mutate = () => {
+      slot.disease = true;
+      p.diseaseLog.push({ era: G.era, slotIdx: idx, name: a.dis });
+      log(`${p.name}: 自家交配 → 既に劣勢発現、疾患「${a.dis}」発症。`, 'loss');
+    };
+  } else {
+    // Dominant → flip to recessive (homozygous expression)
+    outcome = `Slot${roll}「${a.name}」を劣勢発現!`;
+    triggered = true;
+    mutate = () => {
+      slot.recessive = true;
+      log(`${p.name}: 自家交配 → Slot${roll}「${a.name}」を劣勢発現。`, 'event');
+    };
   }
   const rolls = [{ label: `Slot${roll}`, value: roll, outcome, triggered }];
   if (rerollVal !== null) {
     rolls.unshift({ label: '婚約者効果で振り直し', value: rerollVal, outcome: '振り直し成立' });
   }
   showCutin({
-    kind: 'dice-cross',
+    kind,
     title: `${p.name}: 自家交配`,
     subtitle: '1d6 で対象スロット決定',
     diceRolls: rolls,
+    onDismiss: mutate,
   });
-  endTurn();
+  runAfterCutins(() => endTurn());
 }
 
+// ----- Rule (nominate other): exchange two alleles between players.
+// Diseased slots are NOT eligible. If the rolled slot has disease, the rule
+// resolves the swap to its right neighbor (next non-disease, non-empty slot).
 function doNominateOther(p, target) {
-  // Pay 1 VP to target as Stud Fee
+  // Stud Fee
   p.vp -= 1;
   const fee = (target.characterId === 'wife') ? 2 : 1;
   target.vp += fee;
   target.studFees += fee;
   log(`${p.name}: ${target.name} に Stud Fee ${fee}VP 支払い。`, 'event');
 
-  // Roll for own slot
-  let myRoll, myIdx, myEmpty = 0;
-  do { myRoll = rollD6(`${p.name}: 自分のスロット`); myIdx = myRoll - 1; myEmpty++; } while (!p.slots[myIdx] && myEmpty < 12);
-  if (!p.slots[myIdx]) { log(`${p.name}: 自身のスロットが空白続きでアクション無駄に。`, 'loss'); return endTurn(); }
+  // Resolve a slot for player `who`: roll d6; if empty re-roll; if disease, shift right.
+  const resolveSlot = (who, label) => {
+    let roll, idx, attempts = 0;
+    do {
+      roll = rollD6(label);
+      idx = roll - 1;
+      attempts++;
+    } while (!who.slots[idx] && attempts < 12);
+    if (!who.slots[idx]) return { ok: false, roll, idx, reason: 'empty' };
+    let shiftedFrom = null;
+    if (who.slots[idx].disease) {
+      const j = shiftRightToSwappable(who.slots, idx);
+      if (j === -1) return { ok: false, roll, idx, reason: 'all-disease' };
+      shiftedFrom = idx;
+      idx = j;
+    }
+    return { ok: true, roll, idx, shiftedFrom };
+  };
 
-  let tRoll, tIdx, tEmpty = 0;
-  do { tRoll = rollD6(`${target.name}: 相手のスロット`); tIdx = tRoll - 1; tEmpty++; } while (!target.slots[tIdx] && tEmpty < 12);
-  if (!target.slots[tIdx]) { log(`${target.name}: スロットが空白続きで交換失敗。`, 'loss'); return endTurn(); }
+  const me = resolveSlot(p, `${p.name}: 自分のスロット`);
+  if (!me.ok) {
+    log(`${p.name}: ${me.reason === 'empty' ? '自身のスロットが空白続き' : '自身のアレルが全て疾患'}で交換失敗。`, 'loss');
+    return endTurn();
+  }
+  const tg = resolveSlot(target, `${target.name}: 相手のスロット`);
+  if (!tg.ok) {
+    log(`${target.name}: ${tg.reason === 'empty' ? 'スロット空白続き' : '相手のアレルが全て疾患'}で交換失敗。`, 'loss');
+    return endTurn();
+  }
 
-  // Swap
-  const a = p.slots[myIdx], b = target.slots[tIdx];
+  const a = p.slots[me.idx], b = target.slots[tg.idx];
+  const outcomeMe = (me.shiftedFrom != null
+    ? `Slot${me.shiftedFrom + 1}は疾患 → 右へずれ Slot${me.idx + 1}「${ALLELE_BY_ID[a.type].name}」`
+    : `Slot${me.idx + 1}「${ALLELE_BY_ID[a.type].name}」`);
+  const outcomeTg = (tg.shiftedFrom != null
+    ? `Slot${tg.shiftedFrom + 1}は疾患 → 右へずれ Slot${tg.idx + 1}「${ALLELE_BY_ID[b.type].name}」`
+    : `Slot${tg.idx + 1}「${ALLELE_BY_ID[b.type].name}」`);
+
   showCutin({
     kind: 'dice-exchange',
     title: `指名交換: ${p.name} ⇄ ${target.name}`,
-    subtitle: `双方が1d6で対象スロットを決定`,
+    subtitle: `双方が1d6で対象スロットを決定（疾患スロットは右へずれる）`,
     diceRolls: [
-      { label: `${p.name}`,      value: myRoll, outcome: `Slot${myIdx + 1}「${ALLELE_BY_ID[a.type].name}」` , triggered: true },
-      { label: `${target.name}`, value: tRoll,  outcome: `Slot${tIdx + 1}「${ALLELE_BY_ID[b.type].name}」`, triggered: true },
+      { label: p.name,      value: me.roll, outcome: outcomeMe, triggered: true },
+      { label: target.name, value: tg.roll, outcome: outcomeTg, triggered: true },
     ],
+    onDismiss: () => {
+      p.slots[me.idx] = null;
+      target.slots[tg.idx] = null;
+      log(`${p.name}↔${target.name}: Slot${me.idx + 1}(${ALLELE_BY_ID[a.type].name}) ↔ Slot${tg.idx + 1}(${ALLELE_BY_ID[b.type].name}) 交換。`);
+      placeAlleleInSlot(p, b.type, me.idx, b.recessive);
+      placeAlleleInSlot(target, a.type, tg.idx, a.recessive);
+    },
   });
-  p.slots[myIdx] = null;
-  target.slots[tIdx] = null;
-  log(`${p.name}↔${target.name}: Slot${myIdx + 1}(${ALLELE_BY_ID[a.type].name}) ↔ Slot${tIdx + 1}(${ALLELE_BY_ID[b.type].name}) 交換。`);
-  // Place each
-  placeAlleleInSlot(p, b.type, myIdx, b.recessive);
-  placeAlleleInSlot(target, a.type, tIdx, a.recessive);
-  endTurn();
+  runAfterCutins(() => endTurn());
 }
 
 // ===== Action: Claim memory =====
@@ -991,11 +1118,14 @@ function useResearch(p, cardId) {
     case 'r_paper':   p.vp += 5; log(`${p.name}: 論文発表！ +5VP`, 'gain'); break;
     case 'r_genome':  p.vp += 2; log(`${p.name}: 遺伝子鑑定 +2VP`, 'gain'); break;
     case 'r_antidote': {
+      // 新ルール: 疾患の治療法はカード削除のみ。解毒剤は疾患持ちアレルを疾患ごと完全に除去する。
       const idx = p.slots.findIndex(s => s && s.disease);
       if (idx === -1) { log(`${p.name}: 解毒剤を使用したが疾患なし。`); }
       else {
-        p.slots[idx].disease = false;
-        log(`${p.name}: 解毒剤でSlot${idx + 1}の疾患を除去！`, 'gain');
+        const old = p.slots[idx];
+        G.alleleDiscard.push(old.type);
+        p.slots[idx] = null;
+        log(`${p.name}: 解毒剤でSlot${idx + 1}「${ALLELE_BY_ID[old.type].name}」を疾患ごと除去！`, 'gain');
       }
       break;
     }
@@ -1006,12 +1136,12 @@ function useResearch(p, cardId) {
       break;
     }
     case 'r_dominant': {
-      const target = pickOwnSlotAI(p, s => s && s.recessive);
-      if (target == null) { log(`${p.name}: 強制顕性化の対象なし。`); }
+      // 新ルール: 疾患スロットは対象外（疾患は削除でしか治癒不可）
+      const target = pickOwnSlotAI(p, s => s && s.recessive && !s.disease);
+      if (target == null) { log(`${p.name}: 強制顕性化の対象なし（疾患持ちは対象外）。`); }
       else {
         p.slots[target].recessive = false;
-        p.slots[target].disease = false;
-        log(`${p.name}: 強制顕性化 → Slot${target + 1}を表向き化（疾患も除去）。`, 'gain');
+        log(`${p.name}: 強制顕性化 → Slot${target + 1}を表向き化。`, 'gain');
       }
       break;
     }
@@ -1185,9 +1315,9 @@ function endTurn() {
 
 function scheduleAITurnIfNeeded() {
   if (G.ended) return;
-  // If a cutin is on screen waiting for user, hold off — playNextCutin
-  // will call this back once the queue is drained.
-  if (G.cutinPlaying || G.cutinQueue.length > 0) return;
+  // If anything cutin-related is in flight, hold off — the driver will
+  // call this back once everything has drained.
+  if (G.cutinOnScreen || G.cutinQueue.length > 0 || G.afterCutinHooks.length > 0) return;
   const p = activePlayer();
   if (p.isAI) {
     setTimeout(() => aiTakeTurn(), 700);
@@ -1384,29 +1514,17 @@ function aiTakeTurn() {
 }
 
 // ===== Year-End / Conference =====
+// Phases run sequentially through the cutin queue: each cutin must be
+// dismissed (▶ 次へ) before the next phase's calculations run.
+// Year-End is split into 4 independent phases. Each phase queues at most one
+// cutin and waits for the user's ▶ 次へ before the next phase fires its hook.
+// State mutations always happen inside that cutin's onDismiss — never together.
 function yearEnd() {
   log(`━━━ 第${G.era}学会期 終了処理 ━━━`, 'system');
-  // 1. Reveal & evaluate goal
-  evaluateGoal();
-  // 2. Disease check
-  diseaseCheck();
-  // 3. Disease cumulative penalty
-  applyDiseasePenalty();
-
-  if (G.era === NUM_ERAS) {
-    return endGame();
-  }
-  // 4. Reveal next goal
-  G.era += 1;
-  log(`★ 第${G.era}学会期 公開目標: ${GOAL_BY_ID[G.goals[G.era - 1]].name} — ${GOAL_BY_ID[G.goals[G.era - 1]].desc}`, 'system');
-  // 5. President picks next president (simplified: cycle to next)
-  G.presidentIdx = (G.presidentIdx + 1) % NUM_PLAYERS;
-  log(`★ 次任学会理事: ${G.players[G.presidentIdx].name}`, 'system');
-  G.round = 1;
-  G.turnIndex = 0;
-  render();
-  showSeasonStartCutin(G.era);
-  scheduleAITurnIfNeeded();
+  evaluateGoal();                                    // phase 1 — ranking + VP award
+  runAfterCutins(() => diseaseCheck());              // phase 2 — per-player disease rolls
+  runAfterCutins(() => applyDiseasePenaltyPhase()); // phase 3 — disease VP penalty
+  runAfterCutins(() => advanceEraPhase());           // phase 4 — era transition / endGame
 }
 
 function evaluateGoal() {
@@ -1416,30 +1534,22 @@ function evaluateGoal() {
   log(`公開目標「${goal.name}」評価: ${ranking.map(r => `${r.p.name}=${r.score}`).join(', ')}`);
   const vps = [5, 3, 1, 0];
   const cutinLines = [];
+  // Capture per-rank VP awards; apply on cutin dismiss so the player can read the result first.
+  const awards = [];
   for (let i = 0; i < ranking.length; i++) {
     let vp = vps[i];
     let suffix = '';
     if (vp > 0) {
       if (ranking[i].p.characterId === 'mistress') vp += 1;
-      ranking[i].p.vp += vp;
-      log(`${ranking[i].p.name}: ${i + 1}位 → +${vp}VP`, 'gain');
-      G.conferenceVPs.push({ era: G.era, playerId: ranking[i].p.id, rank: i + 1, vp, goalId: goal.id });
+      awards.push({ p: ranking[i].p, rank: i + 1, vp });
       suffix = ` +${vp}VP`;
       if (i === 0) suffix += ' +研究';
     }
     cutinLines.push(`${i + 1}位  ${ranking[i].p.name}  (${ranking[i].score})${suffix}`);
   }
-  // 1st place gets a research card
   const winner = ranking[0].p;
-  const r = drawCard(G.researchDeck, G.researchDiscard);
-  if (r) {
-    winner.research.push(r);
-    log(`${winner.name}: 1位賞として研究「${RESEARCH_BY_ID[r].name}」獲得。`, 'gain');
-  }
-  // Track winner for era track display
   G.conferenceHistory.push({ era: G.era, winnerId: winner.id, goalId: goal.id });
 
-  // Cutin
   showCutin({
     kind: 'ranking',
     title: `第${G.era}学会 結果発表`,
@@ -1447,33 +1557,46 @@ function evaluateGoal() {
     image: `assets/goal-${goal.id}.jpg`,
     lines: cutinLines,
     duration: 3200,
+    onDismiss: () => {
+      for (const a of awards) {
+        a.p.vp += a.vp;
+        log(`${a.p.name}: ${a.rank}位 → +${a.vp}VP`, 'gain');
+        G.conferenceVPs.push({ era: G.era, playerId: a.p.id, rank: a.rank, vp: a.vp, goalId: goal.id });
+      }
+      const r = drawCard(G.researchDeck, G.researchDiscard);
+      if (r) {
+        winner.research.push(r);
+        log(`${winner.name}: 1位賞として研究「${RESEARCH_BY_ID[r].name}」獲得。`, 'gain');
+      }
+    },
   });
 }
 
 function diseaseCheck() {
+  // Roll all dice up front so the values are stable, but defer disease application
+  // until each player's cutin is dismissed (board changes step-by-step).
   for (const p of G.players) {
     const rolls = [];
+    const mutations = [];
     for (let i = 0; i < p.slots.length; i++) {
       const s = p.slots[i];
       if (!s || !s.recessive || s.disease) continue;
-      const roll = rollD6('');  // suppress reason in public-area die
+      const roll = rollD6('');
       const allele = ALLELE_BY_ID[s.type];
       const triggered = roll <= G.era;
       let outcome;
       if (triggered) {
-        s.disease = true;
-        p.diseaseLog.push({ era: G.era, slotIdx: i, name: allele.dis });
-        log(`${p.name}: Slot${i + 1}「${allele.name}」疾患判定 1d6=${roll}≤${G.era} → 疾患「${allele.dis}」発症！`, 'loss');
+        const slotIdx = i, slotRef = s, eraNow = G.era;
+        mutations.push(() => {
+          slotRef.disease = true;
+          p.diseaseLog.push({ era: eraNow, slotIdx, name: allele.dis });
+          log(`${p.name}: Slot${slotIdx + 1}「${allele.name}」疾患判定 1d6=${roll}≤${eraNow} → 疾患「${allele.dis}」発症！`, 'loss');
+        });
         outcome = `≤${G.era} → 発症「${allele.dis}」`;
       } else {
         outcome = `>${G.era} → 安全`;
       }
-      rolls.push({
-        label: `Slot${i + 1} ${allele.name}(劣勢)`,
-        value: roll,
-        outcome,
-        triggered,
-      });
+      rolls.push({ label: `Slot${i + 1} ${allele.name}(劣勢)`, value: roll, outcome, triggered });
     }
     if (rolls.length > 0) {
       showCutin({
@@ -1481,19 +1604,66 @@ function diseaseCheck() {
         title: `${p.name}: 疾患判定`,
         subtitle: `劣勢アレルごとに 1d6 ─ 出目 ≤ ${G.era} で発症`,
         diceRolls: rolls,
+        onDismiss: () => { mutations.forEach(m => m()); },
       });
     }
   }
 }
 
-function applyDiseasePenalty() {
-  for (const p of G.players) {
+// Phase 3: queue a single summary cutin showing each affected player's penalty.
+// Mutations apply on dismiss. If no one has disease, this phase is a no-op
+// and the next phase's hook fires immediately.
+function applyDiseasePenaltyPhase() {
+  const affected = G.players.filter(p => diseaseCount(p) > 0);
+  if (affected.length === 0) return;
+  const lines = affected.map(p => {
     const n = diseaseCount(p);
-    if (n > 0) {
-      p.vp -= n;
-      log(`${p.name}: 疾患マーカー${n}個 → -${n}VP`, 'loss');
-    }
-  }
+    return `${p.name}  疾患${n}個  →  -${n}VP`;
+  });
+  showCutin({
+    kind: 'disease',
+    title: `第${G.era}学会期  疾患ペナルティ`,
+    subtitle: '疾患マーカー累積によるVP減少',
+    lines,
+    onDismiss: () => {
+      for (const p of affected) {
+        const n = diseaseCount(p);
+        p.vp -= n;
+        log(`${p.name}: 疾患マーカー${n}個 → -${n}VP`, 'loss');
+      }
+    },
+  });
+}
+
+// Phase 4: queue the next-season opening cutin. State changes (era++, president
+// rotation, round reset) happen on dismiss so the player sees the announcement
+// while the board still reflects the previous era. On the final era, endGame
+// runs immediately (no further cutin needed before the end screen).
+function advanceEraPhase() {
+  if (G.era === NUM_ERAS) return endGame();
+  const newEra = G.era + 1;
+  const newPrez = (G.presidentIdx + 1) % NUM_PLAYERS;
+  const newGoal = GOAL_BY_ID[G.goals[newEra - 1]];
+  showCutin({
+    kind: 'season',
+    title: `第${newEra}学会期 開幕`,
+    subtitle: `公開目標「${newGoal.name}」`,
+    image: `assets/goal-${newGoal.id}.jpg`,
+    lines: [
+      newGoal.desc + (newGoal.desc_low ? '（最小値が勝利）' : ''),
+      `次任学会理事: ${G.players[newPrez].name}`,
+      '1位:+5VP +研究  2位:+3VP  3位:+1VP',
+    ],
+    onDismiss: () => {
+      G.era = newEra;
+      G.presidentIdx = newPrez;
+      G.round = 1;
+      G.turnIndex = 0;
+      log(`★ 第${G.era}学会期 公開目標: ${newGoal.name} — ${newGoal.desc}`, 'system');
+      log(`★ 次任学会理事: ${G.players[G.presidentIdx].name}`, 'system');
+      render();
+    },
+  });
 }
 
 // ===== End game =====
@@ -1642,7 +1812,8 @@ function showEndScreen() {
 function render() {
   if (G.ended) return;
   renderInfoBar();
-  renderGoalBar();
+  renderGoalDisplay();
+  renderTraitTracks();
   renderPlayers();
   renderActionPanel();
 }
@@ -1671,7 +1842,11 @@ function renderInfoBar() {
   }
   bar.appendChild(track);
 
-  // Round dots
+  // Row 2: round dots (left, fills available width) + president (right).
+  // Wrapping to a second row lets the era track on row 1 use the full width
+  // so the era boxes are big and readable.
+  const row2 = el('div', { class: 'info-bar-row2' });
+
   const roundEl = el('div', { class: 'round-track' });
   roundEl.appendChild(el('span', { class: 'label' }, 'ラウンド'));
   const dots = el('div', { class: 'round-dots' });
@@ -1684,47 +1859,110 @@ function renderInfoBar() {
   }
   roundEl.appendChild(dots);
   roundEl.appendChild(el('span', { class: 'label' }, `${G.round}/${MAX_ROUNDS}`));
-  bar.appendChild(roundEl);
+  row2.appendChild(roundEl);
 
-  // President
   const prez = el('div', { class: 'president-display' },
     el('span', { class: 'crown' }, '♛'),
     el('span', { class: 'label' }, '学会理事:'),
     el('span', { class: 'prez-name' }, G.players[G.presidentIdx].name)
   );
-  bar.appendChild(prez);
+  row2.appendChild(prez);
+
+  bar.appendChild(row2);
 }
 
-function renderGoalBar() {
-  const bar = $('goal-bar');
-  bar.innerHTML = '';
-
-  // Decks
-  bar.appendChild(makeDeckStack('allele', 'アレル', G.alleleDeck.length, G.alleleDiscard.length));
-  bar.appendChild(makeDeckStack('research', '研究', G.researchDeck.length, G.researchDiscard.length));
-  bar.appendChild(makeDeckStack('memory', '記憶', G.memoryDeck.length, 0));
-
-  // Goal card (wide banner with image + text)
+// The prominent vertical goal card on the right side of the public area —
+// it's the most important card on the board. Deck stacks sit at the bottom
+// of the same column so the main (left) column stays compact.
+function renderGoalDisplay() {
+  const host = $('goal-display');
+  if (!host) return;
+  host.innerHTML = '';
   const goal = GOAL_BY_ID[G.goals[G.era - 1]];
-  const goalCard = el('div', { class: 'goal-card' },
-    el('div', { class: 'goal-img', style: `background-image:url(assets/goal-${goal.id}.jpg)` }),
-    el('div', { class: 'goal-text' },
-      el('div', { class: 'goal-label' }, '第' + G.era + '学会期 公開目標'),
-      el('div', { class: 'goal-name' }, goal.name),
-      el('div', { class: 'goal-desc' }, goal.desc + (goal.desc_low ? ' (最小値が勝利)' : ''))
+  if (!goal) return;
+  host.appendChild(el('div', { class: 'goal-prominent' },
+    el('div', { class: 'gp-label' }, `第${G.era}学会期  公開目標`),
+    el('div', { class: 'gp-img', style: `background-image:url(assets/goal-${goal.id}.jpg)` }),
+    el('div', { class: 'gp-name' }, goal.name),
+    el('div', { class: 'gp-desc' }, goal.desc + (goal.desc_low ? '（最小値が勝利）' : '')),
+    el('div', { class: 'gp-divider' }),
+    el('div', { class: 'gp-rewards' },
+      el('div', { class: 'gp-reward-label' }, '報酬'),
+      el('div', { class: 'gp-reward rank-1' }, '1位  +5VP  +研究'),
+      el('div', { class: 'gp-reward rank-2' }, '2位  +3VP'),
+      el('div', { class: 'gp-reward rank-3' }, '3位  +1VP')
+    ),
+    el('div', { class: 'gp-divider' }),
+    el('div', { class: 'gp-decks' },
+      makeDeckStack('allele', 'アレル', G.alleleDeck.length, G.alleleDiscard.length),
+      makeDeckStack('research', '研究', G.researchDeck.length, G.researchDiscard.length),
+      makeDeckStack('memory', '記憶', G.memoryDeck.length, 0)
     )
-  );
-  bar.appendChild(goalCard);
+  ));
+}
 
-  // Dice display
-  const diceArea = el('div', { class: 'dice-area' });
-  diceArea.appendChild(el('div', { class: 'dice-label' }, '1d6'));
-  const dieSlot = el('div', { id: 'die-slot' });
-  const lr = G.lastDieRoll || {};
-  dieSlot.appendChild(buildDie(lr.value || null));
-  diceArea.appendChild(dieSlot);
-  diceArea.appendChild(el('div', { class: 'dice-reason', id: 'die-reason' }, lr.reason || '—'));
-  bar.appendChild(diceArea);
+// ===== Player piece (board-game-style meeple) =====
+const PLAYER_PIECE_SVG = `
+<svg viewBox="0 0 30 36" preserveAspectRatio="xMidYMid meet">
+  <ellipse cx="15" cy="34.5" rx="10" ry="1.4" fill="rgba(0,0,0,0.55)"/>
+  <path d="M9 12 Q8 13 8 14 L3 19 Q2 20.2 3.2 21.2 L10 20 Q10 22.5 9 26 L7 33.5 L13 33.5 L15 27 L17 33.5 L23 33.5 L21 26 Q20 22.5 20 20 L26.8 21.2 Q28 20.2 27 19 L22 14 Q22 13 21 12 Z"
+    fill="currentColor" stroke="rgba(0,0,0,0.7)" stroke-width="0.7" stroke-linejoin="round"/>
+  <circle cx="15" cy="7" r="5.2" fill="currentColor" stroke="rgba(0,0,0,0.7)" stroke-width="0.7"/>
+  <ellipse cx="13.2" cy="5.4" rx="1.6" ry="1.1" fill="rgba(255,255,255,0.55)"/>
+  <ellipse cx="11.5" cy="22" rx="1.4" ry="2.2" fill="rgba(255,255,255,0.18)"/>
+</svg>`;
+
+function buildPlayerPiece(idx, sizeClass = '') {
+  return el('span', {
+    class: 'player-piece p' + idx + (sizeClass ? ' ' + sizeClass : ''),
+    innerHTML: PLAYER_PIECE_SVG,
+  });
+}
+
+// ===== Public trait track (shared score board) =====
+function renderTraitTracks() {
+  const host = $('trait-tracks');
+  if (!host) return;
+  host.innerHTML = '';
+  const TRACK_MAX = 10;  // shows 0..10 cells
+
+  const scores = G.players.map(p => calcTraits(p));
+
+  for (const k of ['健', '艶', '心', '智']) {
+    const row = el('div', { class: 'trait-track', 'data-sys': k });
+    row.appendChild(el('div', { class: 'tt-key' }, k));
+
+    const cells = el('div', { class: 'tt-cells' });
+    for (let i = 0; i <= TRACK_MAX; i++) {
+      const cellCls = ['tt-cell'];
+      if (i % 5 === 0) cellCls.push('milestone');
+      cells.appendChild(el('div', { class: cellCls.join(' ') }, String(i)));
+    }
+    // Group players by score so multiple pieces on the same cell stack with offset.
+    const tokens = el('div', { class: 'tt-tokens' });
+    const byScore = {};
+    G.players.forEach((_p, i) => {
+      const v = Math.min(TRACK_MAX, scores[i][k]);
+      (byScore[v] = byScore[v] || []).push(i);
+    });
+    for (const v of Object.keys(byScore)) {
+      const ids = byScore[v];
+      const baseLeft = (Number(v) / TRACK_MAX) * 100;
+      ids.forEach((idx, j) => {
+        const p = G.players[idx];
+        const tok = el('div', {
+          class: 'tt-token',
+          style: `left: calc(${baseLeft}% - 12px + ${j * 7}px); bottom: ${j * 2}px`,
+          title: `${p.name}: ${k}=${scores[idx][k]}`,
+        });
+        tok.appendChild(buildPlayerPiece(idx));
+        tokens.appendChild(tok);
+      });
+    }
+    cells.appendChild(tokens);
+    row.appendChild(cells);
+    host.appendChild(row);
+  }
 }
 
 function makeDeckStack(kind, label, count, discard) {
@@ -1747,39 +1985,42 @@ function renderPlayers() {
 function renderPlayerBoard(p) {
   const isActive = p.id === activePlayer().id;
   const isPresident = p.id === G.presidentIdx;
-  const t = calcTraits(p);
   const board = el('div', {
     class: 'player-board' + (isActive ? ' active' : '') + (isPresident ? ' president' : ''),
-    style: `--char-bg:url(assets/char-${p.characterId}.jpg)`
+    'data-pid': String(p.id),
+    style: `--char-bg:url(assets/char-${p.characterId}.jpg)`,
   });
+  board.appendChild(el('div', { class: 'player-stripe' }));
 
   const persona = p.isAI && p.personality ? PERSONALITIES[p.personality] : null;
+  const headerLeft = el('span', { class: 'player-header-left' },
+    buildPlayerPiece(p.id, 'header-piece'),
+    el('span', { class: 'player-name' }, p.name + (p.isAI ? '' : ' [あなた]')),
+    el('span', { class: 'player-char' }, ' — ' + CHAR_BY_ID[p.characterId].name),
+    persona ? el('span', {
+      class: 'persona-badge',
+      style: `color:${persona.color};border-color:${persona.color}`,
+      title: persona.flavor
+    }, persona.icon + ' ' + persona.label) : null
+  );
   board.appendChild(el('div', { class: 'player-header' },
-    el('span', {},
-      el('span', { class: 'player-name' }, p.name + (p.isAI ? '' : ' [あなた]')),
-      el('span', { class: 'player-char' }, ' — ' + CHAR_BY_ID[p.characterId].name),
-      persona ? el('span', {
-        class: 'persona-badge',
-        style: `color:${persona.color};border-color:${persona.color}`,
-        title: persona.flavor
-      }, persona.icon + ' ' + persona.label) : null
-    ),
+    headerLeft,
     el('span', { class: 'player-vp' }, el('span', { class: 'num' }, String(p.vp)), ' VP')
   ));
 
-  // Traits with gauge bars (cap at 8 for full bar)
-  const TMAX = 8;
-  const traitsDiv = el('div', { class: 'traits' });
-  for (const k of ['健', '艶', '心', '智']) {
-    const v = t[k];
-    const bar = Math.min(100, Math.round(v / TMAX * 100));
-    const tdiv = el('div', { class: 'trait', 'data-sys': k, style: '--bar:' + bar + '%' },
-      el('span', { class: 'key' }, k),
-      el('span', { class: 'val' }, String(v))
-    );
-    traitsDiv.appendChild(tdiv);
+  // Achieved memory fragments — publicly visible cards (not just chips).
+  // These are the player's "trophies" so they get a proper card display.
+  if (p.achievedMemories.length > 0) {
+    const section = el('div', { class: 'achieved-section' });
+    section.appendChild(el('div', { class: 'achieved-section-label' },
+      `✓ 達成済み記憶の断片 (${p.achievedMemories.length})`));
+    const row = el('div', { class: 'achieved-cards' });
+    for (const id of p.achievedMemories) {
+      row.appendChild(buildMemoryCard(id, p));
+    }
+    section.appendChild(row);
+    board.appendChild(section);
   }
-  board.appendChild(traitsDiv);
 
   // Slot row label
   board.appendChild(el('div', { class: 'slot-row-label' }, '遺伝子スロット'));
@@ -1789,7 +2030,10 @@ function renderPlayerBoard(p) {
   for (let i = 0; i < 6; i++) {
     const s = p.slots[i];
     let opts = {};
-    if (G.pending && !p.isAI) {
+    // G.pending is only set during human turns. Make slots clickable on the
+    // appropriate board — own slots on the human's own board, target slots on
+    // the AI's board for "select_other_slot" (干渉術 etc).
+    if (G.pending && !activePlayer().isAI) {
       if (G.pending.type === 'select_own_slot' && p.id === activePlayer().id && G.pending.filter(i)) {
         opts = { clickable: true, onclick: () => G.pending.cb(i) };
       } else if (G.pending.type === 'select_other_slot' && p.id === G.pending.target && G.pending.filter(i)) {
@@ -1800,22 +2044,25 @@ function renderPlayerBoard(p) {
   }
   board.appendChild(slotsDiv);
 
-  // Memories (visible only to human player)
+  // Memories — private to each player (only the human sees their unachieved ones).
+  // Achieved memories are already shown publicly as chips above.
   const isHuman = !p.isAI;
+  const unachieved = p.memories.filter(id => !p.achievedMemories.includes(id));
   const memSection = el('div', { class: 'cards-section' });
-  memSection.appendChild(el('div', { class: 'label' }, '記憶の断片', el('span', { class: 'count' }, p.memories.length + '枚 / 達成' + p.achievedMemories.length)));
+  memSection.appendChild(el('div', { class: 'label' }, '記憶の断片',
+    el('span', { class: 'count' }, '手札' + unachieved.length + ' / 達成' + p.achievedMemories.length)));
   if (isHuman) {
-    if (p.memories.length === 0) {
-      memSection.appendChild(el('div', { class: 'hint' }, '（まだ無し）'));
+    if (unachieved.length === 0) {
+      memSection.appendChild(el('div', { class: 'hint' }, '（手札なし）'));
     } else {
       const row = el('div', { class: 'card-row' });
-      for (const id of p.memories) {
+      for (const id of unachieved) {
         row.appendChild(buildMemoryCard(id, p));
       }
       memSection.appendChild(row);
     }
   } else {
-    memSection.appendChild(el('div', { class: 'hint' }, '（伏せ手札）'));
+    memSection.appendChild(el('div', { class: 'hint' }, '（伏せ手札 ' + unachieved.length + '枚）'));
   }
   board.appendChild(memSection);
 
@@ -1975,7 +2222,184 @@ function formatEffect(eff) {
   return Object.entries(eff).map(([k, v]) => `${k}+${v}`).join(' ');
 }
 
+// ===== Rules viewer =====
+// Tiny markdown renderer (headers, lists, tables, hr, blockquote, code, paragraphs).
+function renderMarkdown(md) {
+  const lines = md.split(/\r?\n/);
+  const out = [];
+  let inUl = false, inOl = false, inTable = false, inCode = false;
+  let para = [];
+  const flushPara = () => {
+    if (para.length) { out.push('<p>' + inline(para.join(' ')) + '</p>'); para = []; }
+  };
+  const closeLists = () => {
+    if (inUl) { out.push('</ul>'); inUl = false; }
+    if (inOl) { out.push('</ol>'); inOl = false; }
+  };
+  const closeTable = () => {
+    if (inTable) { out.push('</tbody></table>'); inTable = false; }
+  };
+  const inline = s => s
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+
+    if (ln.match(/^```/)) { flushPara(); closeLists(); closeTable(); inCode = !inCode; out.push(inCode ? '<pre><code>' : '</code></pre>'); continue; }
+    if (inCode) { out.push(ln.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')); continue; }
+
+    // Table: a row starts with | and the next line has --- separators
+    if (ln.match(/^\|.*\|$/) && lines[i+1] && lines[i+1].match(/^\|[\s\-:|]+\|$/)) {
+      flushPara(); closeLists();
+      const headers = ln.split('|').slice(1, -1).map(s => s.trim());
+      out.push('<table><thead><tr>' + headers.map(h => '<th>' + inline(h) + '</th>').join('') + '</tr></thead><tbody>');
+      i++;  // skip separator
+      inTable = true;
+      continue;
+    }
+    if (inTable) {
+      if (ln.match(/^\|.*\|$/)) {
+        const cells = ln.split('|').slice(1, -1).map(s => s.trim());
+        out.push('<tr>' + cells.map(c => '<td>' + inline(c) + '</td>').join('') + '</tr>');
+        continue;
+      } else {
+        closeTable();
+      }
+    }
+
+    let m;
+    if (ln.match(/^\s*$/)) { flushPara(); closeLists(); continue; }
+    if (ln.match(/^---+$/) || ln.match(/^===+$/)) { flushPara(); closeLists(); out.push('<hr>'); continue; }
+    if ((m = ln.match(/^(#{1,6})\s+(.*)$/))) { flushPara(); closeLists(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); continue; }
+    if ((m = ln.match(/^>\s?(.*)$/))) { flushPara(); closeLists(); out.push('<blockquote>' + inline(m[1]) + '</blockquote>'); continue; }
+    if ((m = ln.match(/^[-*]\s+(.*)$/))) {
+      flushPara();
+      if (inOl) { out.push('</ol>'); inOl = false; }
+      if (!inUl) { out.push('<ul>'); inUl = true; }
+      out.push('<li>' + inline(m[1]) + '</li>');
+      continue;
+    }
+    if ((m = ln.match(/^\d+\.\s+(.*)$/))) {
+      flushPara();
+      if (inUl) { out.push('</ul>'); inUl = false; }
+      if (!inOl) { out.push('<ol>'); inOl = true; }
+      out.push('<li>' + inline(m[1]) + '</li>');
+      continue;
+    }
+    para.push(ln);
+  }
+  flushPara(); closeLists(); closeTable();
+  if (inCode) out.push('</code></pre>');
+  return out.join('\n');
+}
+
+let _rulesCache = null;
+async function showRulesModal() {
+  if (_rulesCache == null) {
+    try {
+      const res = await fetch('最愛のガラテア_ルールブック.md');
+      _rulesCache = await res.text();
+    } catch (e) {
+      _rulesCache = '# ルールブックを読み込めませんでした\n\nlocalhost 等で起動してください。';
+    }
+  }
+  const overlay = $('modal-overlay');
+  const content = $('modal-content');
+  content.innerHTML = '';
+  const wrap = el('div', { id: 'rules-modal-content' });
+  wrap.innerHTML = renderMarkdown(_rulesCache);
+  const closeBtn = el('button', { id: 'rules-modal-close', onclick: () => closeModal() }, '×');
+  wrap.insertBefore(closeBtn, wrap.firstChild);
+  content.appendChild(wrap);
+  overlay.classList.remove('hidden');
+}
+
+// ===== Card hover preview =====
+let _previewEl = null;
+function getPreviewEl() {
+  if (!_previewEl) {
+    _previewEl = el('div', { class: 'card-preview' });
+    document.body.appendChild(_previewEl);
+  }
+  return _previewEl;
+}
+function hidePreview() {
+  const p = getPreviewEl();
+  p.classList.remove('visible');
+}
+function showPreview(kind, data, mouseEvt) {
+  const p = getPreviewEl();
+  p.className = 'card-preview ' + kind;
+  let html = '';
+  if (kind.startsWith('allele')) {
+    const a = data.allele;
+    const slot = data.slot;  // may be null
+    const eff = (slot && slot.recessive) ? a.rec : a.dom;
+    const stateText = slot ? (slot.recessive ? '裏向き(劣勢発現)' : '表向き(顕性)') : '表向き';
+    html = `
+      <div class="pv-img" style="background-image:url(assets/allele-${a.id}.jpg)"></div>
+      <div class="pv-body">
+        <div class="pv-type">アレル / ${a.sys}系統 — ${stateText}</div>
+        <div class="pv-name">${a.name}</div>
+        <div class="pv-effect">効果: ${formatEffect(eff)}</div>
+        <div class="pv-desc">顕性: ${formatEffect(a.dom)} ／ 劣勢: ${formatEffect(a.rec)}</div>
+        ${(slot && slot.recessive) ? `<div class="pv-tag">⚠ 劣勢時の疾患: 「${a.dis}」 (年末に1d6 ≤ 学会期 で発症)</div>` : `<div class="pv-desc">劣勢時の疾患: 「${a.dis}」</div>`}
+        ${(slot && slot.disease) ? `<div class="pv-tag">☠ 疾患マーカー所持中: 年末ごとに -1VP / 指名交換の対象外</div>` : ''}
+      </div>`;
+  } else if (kind.startsWith('memory')) {
+    const m = data;
+    const reward = MEMORY_REWARD[m.tier];
+    html = `
+      <div class="pv-img" style="background-image:url(assets/memory-${m.id}.jpg)"></div>
+      <div class="pv-body">
+        <div class="pv-type">記憶の断片 / ${m.tier.toUpperCase()}</div>
+        <div class="pv-name">${m.name}</div>
+        <div class="pv-effect">条件: ${m.desc}</div>
+        <div class="pv-desc">達成宣言成功で +${reward}VP / 終了時未達成は -${reward}VP</div>
+      </div>`;
+  } else if (kind === 'research') {
+    const r = data;
+    html = `
+      <div class="pv-img" style="background-image:url(assets/research-${r.id}.jpg)"></div>
+      <div class="pv-body">
+        <div class="pv-type">研究カード</div>
+        <div class="pv-name">${r.name}</div>
+        <div class="pv-effect">${r.desc}</div>
+      </div>`;
+  } else if (kind === 'character') {
+    const c = data;
+    html = `
+      <div class="pv-img" style="background-image:url(assets/char-${c.id}.jpg)"></div>
+      <div class="pv-body">
+        <div class="pv-type">研究者 / ${c.title}</div>
+        <div class="pv-name">${c.name}</div>
+        <div class="pv-effect">${c.effect}</div>
+      </div>`;
+  }
+  p.innerHTML = html;
+  p.classList.add('visible');
+  // Position near cursor but inside viewport
+  const W = 280, H = p.offsetHeight || 380;
+  const margin = 12;
+  let x = mouseEvt.clientX + margin;
+  let y = mouseEvt.clientY + margin;
+  if (x + W > window.innerWidth - 6) x = mouseEvt.clientX - W - margin;
+  if (y + H > window.innerHeight - 6) y = window.innerHeight - H - 6;
+  if (y < 6) y = 6;
+  p.style.left = x + 'px';
+  p.style.top = y + 'px';
+}
+function bindPreview(elNode, kind, data) {
+  elNode.addEventListener('mouseenter', e => showPreview(kind, data, e));
+  elNode.addEventListener('mousemove',  e => showPreview(kind, data, e));
+  elNode.addEventListener('mouseleave', hidePreview);
+}
+
 // ===== Init =====
 window.addEventListener('DOMContentLoaded', () => {
   renderSetup();
+  $('rules-btn').onclick = showRulesModal;
 });

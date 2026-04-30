@@ -72,9 +72,9 @@ const CHAR_BY_ID = Object.fromEntries(CHARACTERS.map(c => [c.id, c]));
 const RESEARCH = [
   { id: 'r_present',   name: '研究発表',     count: 4, type: 'instant', desc: '即座に +3VP' },
   { id: 'r_paper',     name: '論文発表',     count: 3, type: 'instant', desc: '即座に +5VP（学会期3以降）' },
-  { id: 'r_antidote',  name: '解毒剤',       count: 3, type: 'target_disease', desc: '自分の疾患マーカー1個を除去' },
+  { id: 'r_antidote',  name: '解毒剤',       count: 3, type: 'target_disease', desc: '自分の疾患持ちアレル1枚を疾患ごと完全に除去' },
   { id: 'r_recess',    name: '強制裏返し',   count: 3, type: 'target_self_slot', desc: '自分のアレル1枚を強制裏返し' },
-  { id: 'r_dominant',  name: '強制顕性化',   count: 3, type: 'target_self_slot', desc: '自分のアレル1枚を表向きに（疾患も解除）' },
+  { id: 'r_dominant',  name: '強制顕性化',   count: 3, type: 'target_self_slot', desc: '自分の劣勢アレル1枚を表向きに（疾患持ちは対象外）' },
   { id: 'r_mutate',    name: '変異誘発',     count: 3, type: 'target_self_slot', desc: 'アレル1枚をランダムなアレルと交換' },
   { id: 'r_copy',      name: '複製術',       count: 2, type: 'target_self_slot', desc: 'アレル1枚を別スロットへ複製（ホモ接合発生）' },
   { id: 'r_oracle',    name: '古文書解読',   count: 3, type: 'instant', desc: '記憶デッキ上3枚を見て1枚キープ' },

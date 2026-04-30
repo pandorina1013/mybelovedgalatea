@@ -11,7 +11,9 @@
       "Bash(python _dl_alleles.py)",
       "Bash(PYTHONIOENCODING=utf-8 python _dl_images.py memory)",
       "Bash(PYTHONIOENCODING=utf-8 python _dl_images.py)",
-      "Bash(PYTHONIOENCODING=utf-8 python _dl_images.py research)"
+      "Bash(PYTHONIOENCODING=utf-8 python _dl_images.py research)",
+      "Bash(node --check \"c:/Users/pandorina1013/Documents/GitHub/mybelovedgalatea/game.js\")",
+      "Bash(node --check \"c:/Users/pandorina1013/Documents/GitHub/mybelovedgalatea/data.js\")"
     ]
   }
 }
