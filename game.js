@@ -1240,9 +1240,13 @@ function doNominateOther(p, target, options) {
     onDismiss: () => {
       p.slots[me.idx] = null;
       target.slots[tg.idx] = null;
-      log(`${p.name}↔${target.name}: Slot${me.idx + 1}(${ALLELE_BY_ID[a.type].name}) ↔ Slot${tg.idx + 1}(${ALLELE_BY_ID[b.type].name}) 交換。`);
-      placeAlleleInSlot(p, b.type, me.idx, b.recessive);
-      placeAlleleInSlot(target, a.type, tg.idx, a.recessive);
+      log(`${p.name}↔${target.name}: Slot${me.idx + 1}(${ALLELE_BY_ID[a.type].name}) ↔ Slot${tg.idx + 1}(${ALLELE_BY_ID[b.type].name}) 交換 (双方とも表向きで配置)。`);
+      // Rule: an exchanged card always lands face-up (顕性) regardless of
+      // its previous recessive state. The receiving player gets a fresh
+      // dominant copy; ホモ接合 may still trigger if a duplicate is already
+      // in their slots, since placeAlleleInSlot runs the homozygous check.
+      placeAlleleInSlot(p, b.type, me.idx, false);
+      placeAlleleInSlot(target, a.type, tg.idx, false);
     },
   });
   runAfterCutins(() => endTurn());
