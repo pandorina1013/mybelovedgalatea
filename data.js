@@ -56,7 +56,7 @@ function uniqueAlleleCount(p) { return new Set(p.slots.filter(s => s).map(s => s
 
 // ----- Character cards -----
 const CHARACTERS = [
-  { id: 'daughter',  name: '最愛の娘',       title: '医師',   effect: '記憶の断片ドロー時、2枚見て1枚選ぶ' },
+  { id: 'daughter',  name: '最愛の娘',       title: '医師',   effect: '記憶の断片ドロー時、4枚見て1枚選ぶ（通常は3枚）' },
   { id: 'wife',      name: '最愛の妻',       title: '教授',   effect: 'Stud Fee 取得時 +1VP（受取が2VP）' },
   { id: 'mistress',  name: '最愛の愛人',     title: '詩人',   effect: '公開目標で受け取るVP +1' },
   { id: 'fiancee',   name: '最愛の婚約者',   title: '騎士',   effect: '自家交配時、1d6を振り直せる' },
@@ -77,7 +77,7 @@ const RESEARCH = [
   { id: 'r_dominant',  name: '強制顕性化',   count: 3, type: 'target_self_slot', desc: '自分の劣勢アレル1枚を表向きに（疾患持ちは対象外）' },
   { id: 'r_mutate',    name: '変異誘発',     count: 3, type: 'target_self_slot', desc: 'アレル1枚をランダムなアレルと交換' },
   { id: 'r_copy',      name: '複製術',       count: 2, type: 'target_self_slot', desc: 'アレル1枚を別スロットへ複製（ホモ接合発生）' },
-  { id: 'r_oracle',    name: '古文書解読',   count: 3, type: 'instant', desc: '記憶デッキ上3枚を見て1枚キープ' },
+  { id: 'r_oracle',    name: '古文書解読',   count: 3, type: 'instant', desc: '記憶デッキ上5枚を見て1枚キープ（残りは山札底へ）' },
   { id: 'r_catalyst',  name: '触媒研究',     count: 3, type: 'instant', desc: '研究山札上3枚を見て1枚キープ' },
   { id: 'r_foresight', name: '学会先見',     count: 2, type: 'instant', desc: '次々学会期の公開目標を覗く' },
   { id: 'r_collab',    name: '共同研究',     count: 2, type: 'target_player', desc: '他プレイヤー1名と協力、両者+2VP' },

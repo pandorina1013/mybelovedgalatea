@@ -682,32 +682,33 @@ function placeAlleleInSlot(p, alleleId, slotIdx, recessive = false) {
 // ===== Trait calculation (already in data.js: calcTraits) =====
 
 // ===== Action: Draw memory =====
+//
+// Rule (Ticket-to-Ride style): peek the top 3 cards of the memory deck,
+// keep 1, return the others to the bottom of the deck (FIFO). The
+// 最愛の娘 character effect peeks 4 instead of 3 (still picks 1).
 function actDrawMemory() {
   const p = activePlayer();
   if (G.memoryDeck.length === 0) { log('記憶デッキが尽きた…'); return endTurn(); }
 
   const isDaughter = p.characterId === 'daughter';
-  const drawN = isDaughter ? 2 : 1;
+  const peekN = isDaughter ? 4 : 3;
   const drawn = [];
-  for (let i = 0; i < drawN && G.memoryDeck.length > 0; i++) drawn.push(G.memoryDeck.pop());
+  for (let i = 0; i < peekN && G.memoryDeck.length > 0; i++) drawn.push(G.memoryDeck.pop());
+  if (drawn.length === 0) { log('記憶デッキが尽きた…'); return endTurn(); }
+
+  const titleSuffix = isDaughter ? '（娘効果: 4枚から1枚）' : '（3枚から1枚）';
 
   if (p.isAI) {
-    // AI picks the most achievable / valuable memory
     const pick = aiPickMemory(p, drawn);
     p.memories.push(pick);
     drawn.filter(m => m !== pick).forEach(m => G.memoryDeck.unshift(m));  // return to bottom
-    log(`${p.name}: 記憶の断片「${MEMORY_BY_ID[pick].name}」を獲得。`);
-    endTurn();
-  } else if (drawN === 1) {
-    p.memories.push(drawn[0]);
-    log(`${p.name}: 記憶の断片「${MEMORY_BY_ID[drawn[0]].name}」を獲得。`);
+    log(`${p.name}: 記憶の断片${titleSuffix}「${MEMORY_BY_ID[pick].name}」を獲得（残り${drawn.length - 1}枚は山札底へ）。`);
     endTurn();
   } else {
-    // Human + daughter: choose one
-    showCardPickerModal('記憶の断片を選択', drawn.map(id => MEMORY_BY_ID[id]), card => {
+    showCardPickerModal('記憶の断片を選択 ' + titleSuffix, drawn.map(id => MEMORY_BY_ID[id]), card => {
       p.memories.push(card.id);
       drawn.filter(id => id !== card.id).forEach(id => G.memoryDeck.unshift(id));
-      log(`${p.name}: 記憶の断片「${card.name}」を獲得（もう1枚は山札底へ）。`);
+      log(`${p.name}: 記憶の断片「${card.name}」を獲得（残り${drawn.length - 1}枚は山札底へ）。`);
       endTurn();
     });
   }
@@ -1384,19 +1385,20 @@ function useResearch(p, cardId) {
       break;
     }
     case 'r_oracle': {
+      // The standard memory draw already peeks 3; the oracle goes deeper.
       const peek = [];
-      for (let i = 0; i < 3 && G.memoryDeck.length > 0; i++) peek.push(G.memoryDeck.pop());
+      for (let i = 0; i < 5 && G.memoryDeck.length > 0; i++) peek.push(G.memoryDeck.pop());
       if (peek.length === 0) { log(`${p.name}: 記憶デッキが尽きていた。`); break; }
       if (p.isAI) {
         const pick = aiPickMemory(p, peek);
         p.memories.push(pick);
         peek.filter(id => id !== pick).forEach(id => G.memoryDeck.unshift(id));
-        log(`${p.name}: 古文書解読 → 記憶「${MEMORY_BY_ID[pick].name}」獲得。`);
+        log(`${p.name}: 古文書解読 (5枚から1枚) → 記憶「${MEMORY_BY_ID[pick].name}」獲得。`);
       } else {
-        showCardPickerModal('古文書解読: 1枚をキープ', peek.map(id => MEMORY_BY_ID[id]), card => {
+        showCardPickerModal('古文書解読: 5枚から1枚キープ', peek.map(id => MEMORY_BY_ID[id]), card => {
           p.memories.push(card.id);
           peek.filter(id => id !== card.id).forEach(id => G.memoryDeck.unshift(id));
-          log(`${p.name}: 古文書解読 → 記憶「${card.name}」獲得。`);
+          log(`${p.name}: 古文書解読 (5枚から1枚) → 記憶「${card.name}」獲得。`);
           render();
         });
       }
