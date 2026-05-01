@@ -35,13 +35,15 @@ const PERSONALITIES = {
     flavor: '妨害と速攻。盤面をかき回し、リーダーから狙ったカードを引き抜く。Stud Fee は惜しまない。',
     scoreMult: {
       conference:     1.40,  // close it the moment I'm ahead
-      draw_memory:    1.30,  // takes risks for high-tier rewards
+      draw_memory:    1.45,  // +VP/-VP swing is bigger now that 3-card peek lowers miss risk
       remove_allele:  0.55,  // tolerates disease (won't waste actions cleaning)
       self_nominate:  0.85,  // disease cascade is now too painful to chase recklessly
       nominate_other: 2.30,  // attack the leader
       draw_research:  1.05,
       pass:           0.20,
     },
+    // Picks the highest-VP memory it can plausibly reach.
+    memoryTierBias: { easy: -0.5, medium: 0.5, hard: 1.5 },
     freeUse(p, cardId) {
       const has = id => p.research.includes(id);
       if (cardId === 'r_present')   return has('r_present');
@@ -92,13 +94,15 @@ const PERSONALITIES = {
     scoreMult: {
       claim:          1.15,
       remove_allele:  1.75,  // disease can only be removed via deletion
-      draw_memory:    0.55,  // -VP risk on misses
+      draw_memory:    0.95,  // 3-card peek removes the worst -VP risk; defender now happy to draw safe easies
       self_nominate:  0.20,  // self-cross risks disease cascade — almost never
       nominate_other: 0.45,  // peace-loving, occasional only
       conference:     0.90,
       draw_allele:    1.15,
       pass:           1.45,
     },
+    // Hoards the safest tier — happy to skip Hard entirely.
+    memoryTierBias: { easy: 1.5, medium: 0, hard: -2.0 },
     freeUse(p, cardId) {
       const has = id => p.research.includes(id);
       if (cardId === 'r_present')   return has('r_present');
@@ -138,9 +142,11 @@ const PERSONALITIES = {
       nominate_other: 1.95,                                                      // exchange-heavy
       remove_allele:  1.05,
       self_nominate:  0.70,
-      draw_memory:    0.95,
+      draw_memory:    1.20,                                                      // 3-card peek + free choice fits exploiter's optimization style
       pass:           0.85,
     },
+    // Targets the best ROI band — Medium is exploiter's bread & butter.
+    memoryTierBias: { easy: 0, medium: 1.0, hard: 0.5 },
     freeUse(p, cardId) {
       const has = id => p.research.includes(id);
       if (cardId === 'r_present')   return has('r_present');
@@ -714,16 +720,33 @@ function actDrawMemory() {
   }
 }
 
+// Personality-aware pick. With the new "see 3, keep 1" rule, AIs get real
+// choice — so they should weigh:
+//   - already-satisfied (can be claimed immediately)
+//   - reachability given remaining eras and current board state
+//   - tier reward vs miss-penalty
+//   - already-held → skip duplicates
 function aiPickMemory(p, ids) {
-  // Prefer easy that p already satisfies, else medium, else easy
-  const sorted = ids.map(id => MEMORY_BY_ID[id]).sort((a, b) => {
-    const aSat = a.cond(p) ? 1 : 0;
-    const bSat = b.cond(p) ? 1 : 0;
-    if (aSat !== bSat) return bSat - aSat;
-    const tier = { easy: 1, medium: 2, hard: 3 };
-    return tier[a.tier] - tier[b.tier];
-  });
-  return sorted[0].id;
+  const persona = PERSONALITIES[p.personality] || PERSONALITIES.exploiter;
+  const eraLeft = NUM_ERAS - G.era + 1;
+  const tierBias = persona.memoryTierBias || { easy: 0, medium: 0, hard: 0 };
+
+  let bestId = ids[0], bestScore = -Infinity;
+  for (const id of ids) {
+    const m = MEMORY_BY_ID[id];
+    const reward = MEMORY_REWARD[m.tier];
+    const already = p.memories.includes(id);                // would be a dup
+    const sat = m.cond(p);
+    // Estimate reachability: how many distinct alleles a satisfaction needs.
+    // We use the same `cond` lambda on a couple of sim states to approximate.
+    let score = 0;
+    if (sat) score += reward * 1.2;                         // ready to claim
+    else     score += reward * Math.max(0.2, eraLeft / NUM_ERAS) - reward * 0.4;  // future-discounted, with miss tail
+    if (already) score -= reward * 1.5;                     // duplicate is a waste
+    score += tierBias[m.tier] || 0;                          // persona flavor
+    if (score > bestScore) { bestScore = score; bestId = id; }
+  }
+  return bestId;
 }
 
 // ===== Action: Draw allele =====
@@ -1674,12 +1697,16 @@ function aiTakeTurn() {
     if (bestRemove > 0) candidates.push({ kind: 'remove_allele', score: 8 + bestRemove });
   }
 
-  // Draw memory — risky late, valuable early
+  // Draw memory — Ticket-to-Ride style 3-card peek means much lower miss
+  // risk than the old blind draw, so the curve stays above zero longer.
+  // Daughter character peeks 4 → even safer.
   let memScore = -100;
-  if (p.memories.length === 0) memScore = 32;
-  else if (p.memories.length < 3 && G.era <= 3) memScore = 22 - p.memories.length * 3;
-  else if (p.memories.length < 5 && G.era <= 2) memScore = 12;
-  else if (G.era <= 2) memScore = 6;
+  const peekSize = (p.characterId === 'daughter') ? 4 : 3;
+  if (p.memories.length === 0) memScore = 36 + peekSize;                     // first memory is huge
+  else if (p.memories.length < 3) memScore = 26 + peekSize - p.memories.length * 3;
+  else if (p.memories.length < 5 && G.era <= 4) memScore = 16 + (peekSize - 3) * 2;
+  else if (G.era <= 3) memScore = 8;
+  else if (p.memories.length < 7 && G.era <= 4) memScore = 4;                // late-era top-up
   if (memScore > -100) candidates.push({ kind: 'draw_memory', score: memScore });
 
   // Draw research
